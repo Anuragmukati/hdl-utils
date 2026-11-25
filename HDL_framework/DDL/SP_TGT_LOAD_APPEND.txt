@@ -1,0 +1,90 @@
+CREATE OR REPLACE PROCEDURE `@project.edw_data_migration_ops_tbls.SP_TGT_LOAD_APPEND`(IN project_id STRING, IN stage_dataset STRING, IN target_dataset STRING, IN table_name_1 STRING, stage_table STRING)
+BEGIN
+DECLARE
+  datetime_columns ARRAY<STRUCT<external_name STRING,
+  target_name STRING>>;
+DECLARE
+  time_columns ARRAY<STRUCT<external_name STRING,
+  target_name STRING>>;
+DECLARE
+  timestamp_columns ARRAY<STRUCT<external_name STRING,
+  target_name STRING>>;
+DECLARE
+  numeric_columns ARRAY<STRUCT<external_name STRING,
+  target_name STRING>>;
+DECLARE
+  bignumeric_columns ARRAY<STRUCT<external_name STRING,
+  target_name STRING>>;
+DECLARE
+  interval_columns ARRAY<STRUCT<external_name STRING,
+  target_name STRING>>;
+DECLARE
+  column_list ARRAY<STRING>;
+DECLARE
+  column_expression STRING;
+DECLARE
+  row_count_after_insert INT64;
+
+BEGIN TRANSACTION;
+
+BEGIN
+EXECUTE IMMEDIATE
+  FORMAT("""           SELECT ARRAY_AGG(STRUCT(stage.column_name AS external_name, target.column_name AS target_name))           FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS stage           JOIN `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS target           ON lower(stage.column_name) = lower(target.column_name)           WHERE stage.table_name = '%s'             AND target.table_name = '%s'             AND stage.data_type = 'STRING'             AND target.data_type = 'DATETIME'         """, project_id, stage_dataset, project_id, target_dataset, stage_table, table_name_1) INTO datetime_columns;
+EXECUTE IMMEDIATE
+  FORMAT("""           SELECT ARRAY_AGG(STRUCT(stage.column_name AS external_name, target.column_name AS target_name))           FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS stage           JOIN `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS target           ON lower(stage.column_name) = lower(target.column_name)           WHERE stage.table_name = '%s'             AND target.table_name = '%s'             AND stage.data_type = 'STRING'             AND target.data_type = 'TIMESTAMP'          """, project_id, stage_dataset, project_id, target_dataset, stage_table, table_name_1) INTO timestamp_columns;
+EXECUTE IMMEDIATE
+  FORMAT("""           SELECT ARRAY_AGG(STRUCT(stage.column_name AS external_name, target.column_name AS target_name))           FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS stage           JOIN `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS target           ON lower(stage.column_name) = lower(target.column_name)           WHERE stage.table_name = '%s'             AND target.table_name = '%s'             AND stage.data_type = 'STRING'             AND target.data_type = 'TIME'          """, project_id, stage_dataset, project_id, target_dataset, stage_table, table_name_1) INTO time_columns;
+EXECUTE IMMEDIATE
+  FORMAT("""           SELECT ARRAY_AGG(STRUCT(stage.column_name AS external_name, target.column_name AS target_name))           FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS stage           JOIN `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS target           ON lower(stage.column_name) = lower(target.column_name)           WHERE stage.table_name = '%s'             AND target.table_name = '%s'             AND stage.data_type = 'STRING'             AND  REGEXP_CONTAINS(target.data_type, '^NUMERIC')          """, project_id, stage_dataset, project_id, target_dataset, stage_table, table_name_1) INTO numeric_columns;
+EXECUTE IMMEDIATE
+  FORMAT("""           SELECT ARRAY_AGG(STRUCT(stage.column_name AS external_name, target.column_name AS target_name))           FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS stage           JOIN `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS target           ON lower(stage.column_name) = lower(target.column_name)           WHERE stage.table_name = '%s'             AND target.table_name = '%s'             AND stage.data_type = 'STRING'             AND REGEXP_CONTAINS(target.data_type, '^BIGNUMERIC')          """, project_id, stage_dataset, project_id, target_dataset, stage_table, table_name_1) INTO bignumeric_columns;
+EXECUTE IMMEDIATE
+  FORMAT("""           SELECT ARRAY_AGG(STRUCT(stage.column_name AS external_name, target.column_name AS target_name))           FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS stage           JOIN `%s.%s.INFORMATION_SCHEMA.COLUMNS` AS target           ON lower(stage.column_name) = lower(target.column_name)           WHERE stage.table_name = '%s'             AND target.table_name = '%s'             AND stage.data_type = 'STRING'             AND target.data_type = 'INTERVAL'         """, project_id, stage_dataset, project_id, target_dataset, stage_table, table_name_1) INTO interval_columns;
+EXECUTE IMMEDIATE
+  FORMAT("""           SELECT ARRAY_AGG(column_name)           FROM `%s.%s.INFORMATION_SCHEMA.COLUMNS`           WHERE table_name = '%s'         """, project_id, stage_dataset, stage_table) INTO column_list;
+SET
+  column_expression = (
+  SELECT
+    STRING_AGG(
+      CASE
+        WHEN col IN ( SELECT external_name FROM UNNEST(datetime_columns)) THEN FORMAT("SAFE_CAST(ext.%s AS DATETIME) AS %s", col, col)
+        WHEN col IN ( SELECT external_name FROM UNNEST(interval_columns)) THEN FORMAT("SAFE_CAST(ext.`%s` AS INTERVAL) AS `%s`", col, col)
+        WHEN col IN (
+      SELECT
+        external_name
+      FROM
+        UNNEST(timestamp_columns)) THEN FORMAT("SAFE_CAST(ext.`%s` AS TIMESTAMP) AS `%s`", col, col)
+        WHEN col IN (
+      SELECT
+        external_name
+      FROM
+        UNNEST(time_columns)) THEN FORMAT("SAFE_CAST(ext.%s AS TIME) AS %s", col, col)
+        WHEN col IN ( SELECT external_name FROM UNNEST(numeric_columns)) THEN FORMAT("SAFE_CAST(ext.%s AS NUMERIC) AS %s", col, col)
+        WHEN col IN (
+      SELECT
+        external_name
+      FROM
+        UNNEST(bignumeric_columns)) THEN FORMAT("SAFE_CAST(replace(ext.`%s`,' ','') AS BIGNUMERIC) AS `%s`", col, col)
+        ELSE FORMAT("ext.%s", col)
+    END
+      )
+  FROM
+    UNNEST(column_list) AS col );
+EXECUTE IMMEDIATE
+  FORMAT("""           INSERT INTO `%s.%s.%s`           SELECT %s FROM `%s.%s.%s` ext         """, project_id, target_dataset, table_name_1, column_expression, project_id, stage_dataset, stage_table);
+
+COMMIT TRANSACTION;
+
+EXCEPTION WHEN ERROR THEN
+  ROLLBACK TRANSACTION;
+  RAISE;
+END;
+
+EXECUTE IMMEDIATE
+  FORMAT( "SELECT COUNT(1) FROM `%s.%s.%s`", project_id, target_dataset, table_name_1 ) INTO row_count_after_insert;
+IF
+  row_count_after_insert > 0 THEN
+EXECUTE IMMEDIATE
+  FORMAT( "DROP TABLE `%s.%s.%s`", project_id, stage_dataset, stage_table );
+END IF;
+END;

@@ -1,0 +1,140 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowFailException,AirflowSkipException
+from airflow.providers.teradata.operators.teradata import TeradataOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryHook,BigQueryInsertJobOperator
+from airflow.hooks.base import BaseHook
+
+import json
+from datetime import datetime
+from datetime import datetime
+import sys
+import random
+import time
+import pendulum
+
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_130/"
+sys.path.append(f"{BASE_DIR}/")
+
+local_tz = pendulum.timezone("America/New_York")
+def read_config():
+    with open('/home/airflow/gcs/dags/PROJECT_ID_130/history_load_config_prod_hdl.json', 'r') as f:
+        confid_details = json.load(f)
+    return confid_details
+
+
+config = read_config()
+
+
+Metadata_db=config["Metadata_Dataset"]
+Metadata_tbl=config["Metadata_Tbl"]
+HDL_project=config["hdl_source_project"]
+hdl_source_connection_id=config["hdl_source_connection_id"]
+
+
+time.sleep(random.randint(1,18))
+
+
+def create_metadata(**kwargs):
+    Table_Name=kwargs['dag_run'].conf.get('Table_Name','')
+    App_Name=kwargs['dag_run'].conf.get('App_Name','')
+    Envrionment=kwargs['dag_run'].conf.get('Envrionment','')
+    Where_condition=kwargs['dag_run'].conf.get('Where_Condition','')
+    if not Table_Name:
+        print("Please provide Table List")
+        raise AirflowFailException("Please provide Table List")
+    if not App_Name:
+        print("Please provide App_Name")
+        raise AirflowFailException("Please provide App_Name")
+    
+
+    app_name_to_prd_proj = {
+        "Adcpdo": "adcpdo",
+        "Zdwvdo": "zdwvdo",
+        "Enabdo": "enabdo",
+        "Enabdo_PP_Full": "enabdo",
+        "Enabdo_p2": "enabdo",
+        "Pblsdo": "pblsdo",
+        "Msgcdo": "msgcdo",
+        "Msgcdo_p2": "msgcdo",
+        "Vzendo": "vzendo",
+        "Fpardo": "fpardo",
+        "NOS_First": "gk1vdo",
+        "OneEx": "gk1vdo",
+        "Cmhbdo": "cmhbdo",
+        "Bizdo": "bizdo",
+        "BizOps": "bizdo",
+        "Oneexp2": "gk1vdo",
+        "Gk1vdo": "gk1vdo",
+        "Gk1vdo_p2": "gk1vdo",
+        "Gk1vdo_PP_Hist": "gk1vdo",
+        "Gk1vdo_PP_Full": "gk1vdo",
+        "Gk1vdo_PP_Incr": "gk1vdo",
+        "Gk1vdo_PP_Full_Daily": "gk1vdo",
+        "Zdwvdo_PP_Full_Daily": "zdwvdo",
+    }
+    
+    prd_proj = app_name_to_prd_proj.get(App_Name)
+    GCP_CONN_DO_ID=''
+    if Envrionment.lower()=='ple':
+        bq_project=config[f"bq_ple_project_{prd_proj}"]
+        GCP_CONN_DO_ID = config[f"GCP_CONN_DO_ID_PLE_{prd_proj}"]
+    elif Envrionment.lower()=='prod':
+        bq_project=config[f"bq_prod_project_{prd_proj}"]
+        GCP_CONN_DO_ID = config[f"GCP_CONN_DO_ID_{prd_proj}"]
+    else:
+         print("Environment value is not correct. Pass either prod or ple")
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    
+    prd_proj = app_name_to_prd_proj.get(App_Name)
+    
+    if not prd_proj:
+        print("Pass correct App Name and check with developer if it's a new app name")
+        raise AirflowFailException("Pass correct App Name and check with developer if it's a new app name")
+    
+    delete_data_sql=f"delete from `{bq_project}.{Table_Name}` where {Where_condition};"
+    print(delete_data_sql)
+    try:
+            cursor.execute(delete_data_sql)
+    except:
+            print("delete table query execution failed")
+            raise AirflowFailException("delete table query execution failed")
+
+    delete_data_sql_out=cursor.rowcount
+    print(delete_data_sql_out)
+
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 4, 9,tzinfo=local_tz),
+    'retries': 0
+}
+
+dag = DAG(
+    dag_id=f"delete_data_based_of_where_condition",
+    default_args=default_args,
+    description="DAG to delete data from tables based of where condition",
+    schedule_interval=None,
+    max_active_runs=5,
+    catchup=False,
+    params={
+        "Table_Name": "'db.table1'",
+        "App_Name": "Gk1vdo_PP_Full",
+        "Envrionment":"prod",
+        "Where_Condition":"last_upd_dt < '2023-01-01'"
+    },
+
+)
+    
+
+create_metadata_task=PythonOperator(
+    task_id='create_metadata_task',
+    python_callable=create_metadata,
+    dag=dag,
+    provide_context=True
+)
+
+create_metadata_task

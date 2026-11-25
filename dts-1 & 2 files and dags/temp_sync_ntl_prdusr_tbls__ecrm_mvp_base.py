@@ -1,0 +1,546 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowFailException,AirflowSkipException
+from airflow.providers.teradata.operators.teradata import TeradataOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryHook,BigQueryInsertJobOperator
+from google.cloud.exceptions import NotFound
+from airflow.hooks.base import BaseHook
+import pendulum
+# Define the timezone for EST
+import json
+from datetime import datetime
+import teradatasql
+from datetime import datetime
+import sys
+import random
+import re
+import time
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import traceback
+
+BASE_DIR = "/home/airflow/gcs/dags/vz-it-gk1v-edwpr-0/"
+sys.path.append(f"{BASE_DIR}/")
+
+local_tz = pendulum.timezone("America/New_York")
+
+def read_config():
+    with open('/home/airflow/gcs/dags/vz-it-gk1v-edwpr-0/history_load_config_prod_hdl.json', 'r') as f:
+        confid_details = json.load(f)
+    return confid_details
+
+# gcs details
+# **REWRITTEN GLOBAL CONFIGURATION FOR NEW TABLE**
+config = read_config()
+prj=str('Gk1vdo').lower()
+App_Name=f'Gk1vdo_PP_Full_Daily'
+Table_Name='ntl_prdusr_tbls__ecrm_mvp_base' # **MODIFIED**
+tbl_uid='ntl_prdusr_tbls__ecrm_mvp_base' # **MODIFIED**
+Tbl_Load_Type='Fullload'
+job_id=''
+# **END REWRITTEN CONFIGURATION**
+
+# gcs details
+GCP_CONN_DO_ID = config[f"GCP_CONN_DO_ID_{prj}"]
+GCP_CONN_DO_ID_PLE = config[f"GCP_CONN_DO_ID_PLE_{prj}"]
+GCS_BUCKET = config["GCS_BUCKET"]
+GCS_PREFIX = config["GCS_PREFIX"]
+Audit_db=config["Audit_Dataset"]
+Metadata_db=config["Metadata_Dataset"]
+Metadata_tbl=config["Metadata_Tbl"]
+Audit_tbl=config["Audit_Table"]
+Queue_Table=str(config["Queue_Table_large"])+"_Small_P"
+bq_prod_project=config[f"bq_prod_project_{prj}"]
+bq_ple_project=config[f"bq_ple_project_{prj}"]
+HDL_project=config["hdl_source_project"]
+hdl_source_connection_id=config["hdl_source_connection_id"]
+function_ids=config["function_ids"]
+functional_id_used=function_ids[random.randint(0,len(function_ids)-1)]
+gcs_bucket=config[f"gcs_bucket_name_{prj}"]
+# gcs_bucket="gk1v-prod-edwpr-0-usre-nos-inbound"
+
+time.sleep(random.randint(1,18))
+
+def send_email_report(Status,**kwargs):
+    dag_run_id = kwargs['dag'].dag_id
+    subject = f"HDL DAG Execution Report: {dag_run_id}"
+    recipient_emails = ["aniket.chougule@verizon.com","avinash.nikam@onixnet.com","nikhil.lad@onixnet.com","tanush.singh@onixnet.com", "verizon_hdl_team@onixnet.com"]
+    sender_email = "HDLService@verizon.com"
+    # Email content
+    html_content = f"""
+    <html>
+    <body>
+        <h1>DAG Execution Completed</h1>
+        <p>The DAG <b>{dag_run_id}</b> has {Status}.</p>
+    </body>
+    </html>
+    """
+    # Construct the email
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = sender_email
+    msg["To"] = ", ".join(recipient_emails)
+    msg.attach(MIMEText(html_content, "html"))
+    # Send the email
+    smtp_server = "vzsmtp.verizon.com"
+    smtp_port = 25
+    with smtplib.SMTP(smtp_server, smtp_port) as server:
+        server.ehlo()
+        server.starttls()
+        server.sendmail(sender_email, recipient_emails, msg.as_string())
+    print("Email sent successfully.")
+
+def get_td_tbl_count(td_schema,td_table, cnt_tbl_sql=None):
+    conn=BaseHook.get_connection(functional_id_used)
+    try:
+        #password = access_secret_version("td_pwd")
+        print("**** Getting td row count")
+        connection =teradatasql.connect(
+            host=conn.host,
+            user=conn.login,
+            password=conn.password
+        )
+        cursor = connection.cursor()
+        if not cnt_tbl_sql:
+            cnt_tbl_sql = f"SELECT CAST(COUNT(1) AS BIGINT) FROM {td_schema}.{td_table}"
+        print("sql: ",cnt_tbl_sql)
+        cursor.execute(cnt_tbl_sql)
+        count = cursor.fetchone()[0]
+        cursor.close()
+        connection.close()
+        print(count)
+        return count
+    except Exception as e:
+        print(f"**** Error while getting td row count for table {td_schema}.{td_table}: {str(e)}")
+        return -1
+
+def get_bq_tbl_count(db_nm,tbl_nm,cnt_tbl_sql=None):
+    print("table details",db_nm,tbl_nm)
+    if not cnt_tbl_sql:
+        cnt_tbl_sql="select count(*) from "+str(bq_prod_project)+"."+str(db_nm)+"."+str(tbl_nm)
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(cnt_tbl_sql)
+    except Exception as e :
+        print("Count Query Got Failed",e)
+        return -1
+    cnt_tbl_details=cursor.fetchone()
+    print(cnt_tbl_details)
+    if cnt_tbl_details:
+        bq_tbl_cnt=cnt_tbl_details[0]
+        return bq_tbl_cnt
+    else:
+        print("Table not found")
+        return -1
+    
+def check_table_exists(**kwargs):
+    ti=kwargs['ti']
+    db_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tgt_db')
+    tbl_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tgt_tbl')
+    
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False)
+    client=hook.get_client()
+    tbl_fl_nm=f'{bq_prod_project}.{db_nm}.{tbl_nm}'
+    try:
+        client.get_table(tbl_fl_nm)
+        print(f"Table is exists:{tbl_fl_nm}")
+    except NotFound:
+        print(f"Table is not exists:{tbl_fl_nm}")
+        updt_sql('Skipped',error_message='Table Not Exists',**kwargs)
+        raise AirflowSkipException(f"skipping because table {tbl_fl_nm} not found.")
+
+def updt_mtd_tbl(tbl_uid,app_nm):
+    updt_metadata_sql="update "+str(HDL_project)+"."+str(Metadata_db)+"."+str(Metadata_tbl)+" set spool_flag=1 where table_uid='"+str(tbl_uid)+"' and app_name='"+str(app_nm)+"'"
+    hook = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(updt_metadata_sql)
+    except:
+        print("metadata update stmt failed")
+
+def del_stg_tbl(stg_db,stg_tbl):
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False)
+    stg_tbl_sql=f"DROP TABLE IF EXISTS {bq_prod_project}.{stg_db}.{stg_tbl};"
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(stg_tbl_sql)
+    except:
+        print("Dropping of Stage table got Dailed")
+
+def updt_sql_success(**kwargs):
+    ti=kwargs['ti']
+    dag_run_id = kwargs['dag_run'].run_id
+    dag_id = kwargs['dag'].dag_id
+    dag_id=str(dag_id)+'_'+str(dag_run_id.split('_')[2])
+    dag_run_type=kwargs['dag_run'].run_type
+    db_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tgt_db')
+    tbl_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tgt_tbl')
+    tbl_uid=ti.xcom_pull(task_ids='fetch_metadata', key='tbl_uid')
+    src_db=ti.xcom_pull(task_ids='fetch_metadata', key='src_db')
+    src_tbl=ti.xcom_pull(task_ids='fetch_metadata', key='src_tbl')
+    stg_db=ti.xcom_pull(task_ids='fetch_metadata', key='stg_db')
+    stg_tbl=ti.xcom_pull(task_ids='fetch_metadata', key='stg_tbl')
+    app_nm=ti.xcom_pull(task_ids='fetch_metadata', key='app_name')
+    start_time=ti.xcom_pull(task_ids='fetch_metadata', key='start_time')
+    dag_run_id=ti.xcom_pull(task_ids='fetch_metadata', key='dag_run_id')
+    second_run=ti.xcom_pull(task_ids='fetch_metadata', key='second_run')
+    functional_id_used=ti.xcom_pull(task_ids='fetch_metadata', key='functional_id_used')
+    delta_src_cnt=ti.xcom_pull(task_ids='fetch_metadata', key='td_delta_count')
+    delta_tgt_cnt=ti.xcom_pull(task_ids='stg_to_bq_prod_load', key='delta_tgt_cnt')
+    where_condition_used=ti.xcom_pull(task_ids='fetch_metadata', key='where_condition_used')
+    bq_count=get_bq_tbl_count(db_nm,tbl_nm)
+    td_count=get_td_tbl_count(src_db,src_tbl)
+    
+    if delta_tgt_cnt is None:
+        delta_tgt_cnt=0
+        
+    if bq_count==td_count:
+        is_row_count_matched=True
+    elif bq_count<0:
+        is_row_count_matched=False
+        error_message=str(error_message)+" BQ Row Count Query Failed"
+    elif td_count<0:
+        is_row_count_matched=False
+        error_message=str(error_message)+" TD Row Count Query Failed"
+    else:
+        is_row_count_matched=False
+        
+    cur_time=datetime.now()
+    hook = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+    
+    if second_run is True:
+        updt_mtd_tbl(tbl_uid,app_nm)
+        sql=f'insert into '+str(HDL_project)+'.'+str(Audit_db)+'.'+str(Audit_tbl)+'(dag_id,dag_run_id,dag_run_type,table_uid,stg_schema,stg_table,tgt_schema,tgt_table,start_time,end_time,src_row_count,tgt_row_count,is_row_count_matched,job_status,error_message,load_type,td_functional_id,app_name,src_tbl,src_db,where_condition_used,tgt_project_id,delta_src_cnt,delta_tgt_cnt) values("'+str(dag_id)+'","'+str(dag_run_id)+'","'+str(dag_run_type)+'","'+str(tbl_uid)+'","'+str(stg_db)+'","'+str(stg_tbl)+'","'+str(db_nm)+'","'+str(tbl_nm)+'","'+str(start_time)+'","'+str(cur_time)+'",'+str(td_count)+','+str(bq_count)+','+str(is_row_count_matched)+',"SUCCESS","Second run with parquet got successful.","NOS_Parquet","'+str(functional_id_used)+'","'+str(app_nm)+'","'+str(src_db)+'","'+str(src_tbl)+'","'+str(where_condition_used)+'","'+str(bq_prod_project)+'",'+str(delta_src_cnt)+','+str(delta_tgt_cnt)+')'
+    else:
+        sql=f'insert into '+str(HDL_project)+'.'+str(Audit_db)+'.'+str(Audit_tbl)+'(dag_id,dag_run_id,dag_run_type,table_uid,stg_schema,stg_table,tgt_schema,tgt_table,start_time,end_time,src_row_count,tgt_row_count,is_row_count_matched,job_status,load_type,td_functional_id,app_name,src_tbl,src_db,where_condition_used,tgt_project_id,delta_src_cnt,delta_tgt_cnt) values("'+str(dag_id)+'","'+str(dag_run_id)+'","'+str(dag_run_type)+'","'+str(tbl_uid)+'","'+str(stg_db)+'","'+str(stg_tbl)+'","'+str(db_nm)+'","'+str(tbl_nm)+'","'+str(start_time)+'","'+str(cur_time)+'",'+str(td_count)+','+str(bq_count)+','+str(is_row_count_matched)+',"SUCCESS","NOS_Parquet","'+str(functional_id_used)+'","'+str(app_nm)+'","'+str(src_db)+'","'+str(src_tbl)+'","'+str(where_condition_used)+'","'+str(bq_prod_project)+'",'+str(delta_src_cnt)+','+str(delta_tgt_cnt)+')'
+        
+        print(sql)
+        
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql)
+        del_stg_tbl(stg_db,stg_tbl)
+    except:
+        print("Audit insert got failed")
+        
+    # send_email_report("Completed Successfully",**kwargs)
+
+def updt_sql(status,error_message='',**kwargs):
+    ti=kwargs['ti']
+    dag_run_id = kwargs['dag_run'].run_id
+    dag_id = kwargs['dag'].dag_id
+    dag_id=str(dag_id)+'_'+str(dag_run_id.split('_')[2])
+    dag_run_type=kwargs['dag_run'].run_type
+    db_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tgt_db')
+    tbl_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tgt_tbl')
+    tbl_uid=ti.xcom_pull(task_ids='fetch_metadata', key='tbl_uid')
+    src_db=ti.xcom_pull(task_ids='fetch_metadata', key='src_db')
+    src_tbl=ti.xcom_pull(task_ids='fetch_metadata', key='src_tbl')
+    stg_db=ti.xcom_pull(task_ids='fetch_metadata', key='stg_db')
+    stg_tbl=ti.xcom_pull(task_ids='fetch_metadata', key='stg_tbl')
+    app_nm=ti.xcom_pull(task_ids='fetch_metadata', key='app_name')
+    start_time=ti.xcom_pull(task_ids='fetch_metadata', key='start_time')
+    dag_run_id=ti.xcom_pull(task_ids='fetch_metadata', key='dag_run_id')
+    functional_id_used=ti.xcom_pull(task_ids='fetch_metadata', key='functional_id_used')
+    delta_src_cnt=ti.xcom_pull(task_ids='fetch_metadata', key='td_delta_count')
+    delta_tgt_cnt=0
+    where_condition_used=ti.xcom_pull(task_ids='fetch_metadata', key='where_condition_used')
+    
+    if status=='SKIPPED':
+        bq_count=ti.xcom_pull(task_ids='fetch_metadata', key='bq_count')
+        td_count=ti.xcom_pull(task_ids='fetch_metadata', key='td_count')
+    else:
+        bq_count=get_bq_tbl_count(db_nm,tbl_nm)
+        td_count=get_td_tbl_count(src_db,src_tbl)
+    
+    if bq_count==td_count:
+        is_row_count_matched=True
+    elif bq_count<0:
+        is_row_count_matched=False
+        error_message=str(error_message)+"|BQ Row Count Query Failed"
+    elif td_count<0:
+        is_row_count_matched=False
+        error_message=str(error_message)+"|TD Row Count Query Failed"
+    else:
+        is_row_count_matched=False
+        
+    hook = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+    
+    if status=='STARTED':
+        sql=f'insert into '+str(HDL_project)+'.'+str(Audit_db)+'.'+str(Audit_tbl)+'(dag_id,dag_run_id,dag_run_type,table_uid,stg_schema,stg_table,tgt_schema,tgt_table,start_time,src_row_count,tgt_row_count,is_row_count_matched,job_status,load_type,td_functional_id,app_name,src_db,src_tbl,where_condition_used,tgt_project_id,delta_src_cnt,delta_tgt_cnt) values("'+str(dag_id)+'","'+str(dag_run_id)+'","'+str(dag_run_type)+'","'+str(tbl_uid)+'","'+str(stg_db)+'","'+str(stg_tbl)+'","'+str(db_nm)+'","'+str(tbl_nm)+'","'+str(start_time)+'",'+str(td_count)+','+str(bq_count)+','+str(is_row_count_matched)+',"'+str(status)+'","NOS_Parquet","'+str(functional_id_used)+'","'+str(app_nm)+'","'+str(src_db)+'","'+str(src_tbl)+'","'+str(where_condition_used)+'","'+str(bq_prod_project)+'",'+str(delta_src_cnt)+','+str(delta_tgt_cnt)+')'
+    else:
+        cur_time=datetime.now()
+        sql=f'insert into '+str(HDL_project)+'.'+str(Audit_db)+'.'+str(Audit_tbl)+'(dag_id,dag_run_id,dag_run_type,table_uid,stg_schema,stg_table,tgt_schema,tgt_table,start_time,end_time,src_row_count,tgt_row_count,is_row_count_matched,error_message,job_status,load_type,td_functional_id,app_name,src_db,src_tbl,where_condition_used,tgt_project_id,delta_src_cnt,delta_tgt_cnt) values("'+str(dag_id)+'","'+str(dag_run_id)+'","'+str(dag_run_type)+'","'+str(tbl_uid)+'","'+str(stg_db)+'","'+str(stg_tbl)+'","'+str(db_nm)+'","'+str(tbl_nm)+'","'+str(start_time)+'","'+str(cur_time)+'",'+str(td_count)+','+str(bq_count)+','+str(is_row_count_matched)+',"'+str(error_message)+'","'+str(status)+'","NOS_Parquet","'+str(functional_id_used)+'","'+str(app_nm)+'","'+str(src_db)+'","'+str(src_tbl)+'","'+str(where_condition_used)+'","'+str(bq_prod_project)+'",'+str(delta_src_cnt)+','+str(delta_tgt_cnt)+')'
+        del_stg_tbl(stg_db,stg_tbl)
+        
+    print(sql)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql)
+    except:
+        print("update stmt failed")
+        raise AirflowFailException("update stmt failed")
+
+def get_bq_max_date(cnt_tbl_sql):
+    if not cnt_tbl_sql:
+        print("Please provide the cnt_tbl_sql !!!!!!!!!!!!!!!")
+        return -1
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(cnt_tbl_sql)
+    except:
+        print("Count Query Got Failed")
+    max_dt_details=cursor.fetchone()
+    print(max_dt_details)
+    if max_dt_details:
+        max_dt_val=max_dt_details[0]
+        return max_dt_val
+    else:
+        print("Table not found")
+        return -1
+
+def fetch_metadata(**kwargs):
+    hook = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    dag_run_id="FullLoad_Standalone_Dag"
+    prod_load=True
+    tbl_uid='ntl_prdusr_tbls__ecrm_mvp_base' # **MODIFIED TO MATCH NEW TABLE**
+    metadata_sql="select * from "+str(HDL_project)+"."+str(Metadata_db)+"."+str(Metadata_tbl)+" where  is_table_active is True and lower(Table_uid)=lower('"+str(tbl_uid)+"') and Lower(App_Name) like lower('"+str(App_Name)+"')"
+    try:
+        cursor.execute(metadata_sql)
+    except:
+        print("Metadata Table Query Got Failed")
+        raise AirflowFailException("Metadata Table Query Got Failed")
+    
+    Metadata_details=cursor.fetchone()
+    print(Metadata_details)
+    cur_time=datetime.now()
+    
+    if Metadata_details:
+        tbl_uid=Metadata_details[1]
+        src_db=Metadata_details[2]
+        src_tbl=Metadata_details[3]
+        stg_db=Metadata_details[4]
+        stg_tbl=Metadata_details[5]
+        tgt_db=Metadata_details[6]
+        tgt_tbl=Metadata_details[7]
+        load_type=Metadata_details[8]
+        delta_column=Metadata_details[9]
+        delta_column_type=Metadata_details[10]
+        delta_column_format=Metadata_details[11]
+        delta_interval=Metadata_details[12]
+        app_name=Metadata_details[13]
+        stg_load_flg=Metadata_details[21]
+        pelican_val_flg=Metadata_details[22]
+        fetch_query=Metadata_details[27]
+        where_condition=Metadata_details[31]
+    else:
+        print("No Details Found in Metadata table or its Deactivated due to Production live",tbl_uid)
+        raise AirflowSkipException("No Details Found in Metadata table or its Deactivated due to Production live",tbl_uid)
+
+    #### Inserting the Audit Entry
+    cur_time=datetime.now()
+    stg_tbl=f"{stg_tbl}_{int(cur_time.timestamp())}"
+    stg_tbl_sql=f"CREATE TABLE IF NOT EXISTS {bq_prod_project}.{stg_db}.{stg_tbl} LIKE {bq_prod_project}.{tgt_db}.{tgt_tbl};"
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(stg_tbl_sql)
+    except Exception as e:
+        print("Stage Table Creation Got Failed",e)
+        raise AirflowFailException("Stage Table Creation Got Faile",e)
+        
+    td_count=get_td_tbl_count(src_db,src_tbl)
+    bq_count=get_bq_tbl_count(tgt_db,tgt_tbl)
+    
+    ti = kwargs['ti']
+    ti.xcom_push(key='tbl_uid', value=tbl_uid)
+    ti.xcom_push(key='src_db', value=src_db)
+    ti.xcom_push(key='src_tbl', value=src_tbl)
+    ti.xcom_push(key='stg_db', value=stg_db)
+    ti.xcom_push(key='stg_tbl', value=stg_tbl)
+    ti.xcom_push(key='tgt_db', value=tgt_db)
+    ti.xcom_push(key='tgt_tbl', value=tgt_tbl)
+    ti.xcom_push(key='app_name',value=app_name)
+    ti.xcom_push(key='stg_load_flg',value=stg_load_flg)
+    ti.xcom_push(key='pelican_val_flg',value=pelican_val_flg)
+    ti.xcom_push(key='ple_load',value='False')
+    ti.xcom_push(key='prod_load',value=prod_load)
+    ti.xcom_push(key='functional_id_used',value=functional_id_used)
+    ti.xcom_push(key='start_time',value=cur_time)
+    ti.xcom_push(key='dag_run_id',value=dag_run_id)
+    ti.xcom_push(key='td_count',value=td_count)
+    ti.xcom_push(key='bq_count',value=bq_count)
+    ti.xcom_push(key='td_delta_count',value=0)
+    ti.xcom_push(key='delta_tgt_cnt',value=0)
+    ti.xcom_push(key='where_condition_used',value='')
+    ti.xcom_push(key='fetch_query',value=fetch_query)
+    updt_sql("STARTED",**kwargs)
+    
+    sp_nm='SP_TGT_LOAD'
+    ti.xcom_push(key='tbl_load_type',value=sp_nm)
+    
+    if td_count==0:
+        updt_sql("SKIPPED",error_message='Source have Zero Count for current delta condition',**kwargs)
+        print("Table skipped due to zero count")
+        raise AirflowSkipException("Table skipped due to zero count")
+
+def generate_nos_query(**kwargs):
+    ti = kwargs['ti']
+    tbl_nm=ti.xcom_pull(task_ids='fetch_metadata', key='stg_tbl')
+    fetch_query=ti.xcom_pull(task_ids='fetch_metadata', key='fetch_query')
+    
+    dt=kwargs['execution_date'].strftime('%Y%m%dT%H%M%S')
+    gcs_path = "nos/input/"+"opsstg_tbls"+'_'+str(tbl_nm)+'/'+str(dt)
+    
+    #### Creating NOS SQL Query for Reading Data.
+    sql_query = f"""
+    SELECT * FROM WRITE_NOS (
+        ON ( {fetch_query} )
+        USING
+        LOCATION('/gs/storage-vzit.p.googleapis.com/{gcs_bucket}/{gcs_path}/')
+        AUTHORIZATION(TD_SERVER_DB.NOS_AUTH_PRD_GK1V_EDWPR)
+        STOREDAS('parquet')
+        MAXOBJECTSIZE('16MB')
+        COMPRESSION('SNAPPY')
+    ) AS d;
+    """
+    ti.xcom_push(key='nos_query', value=sql_query)
+    ti.xcom_push(key='gcs_path',value=gcs_path)
+    ti.xcom_push(key='gcs_bucket',value=gcs_bucket)
+    print("Generated Query:", sql_query)
+
+def stg_to_tgt_load(**kwargs):
+    ti = kwargs['ti']
+    stg_db_nm=ti.xcom_pull(task_ids='fetch_metadata', key='stg_db')
+    db_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tgt_db')
+    tbl_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tgt_tbl')
+    stg_tbl=ti.xcom_pull(task_ids='fetch_metadata', key='stg_tbl')
+    sp_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tbl_load_type')
+    
+    delta_tgt_cnt=get_bq_tbl_count(stg_db_nm,stg_tbl)
+    ti.xcom_push(key='delta_tgt_cnt',value=delta_tgt_cnt)
+    
+    sql=f"BEGIN CALL `{bq_prod_project}.{Metadata_db}.{sp_nm}`('{bq_prod_project}','{stg_db_nm}','{db_nm}','{tbl_nm}','{stg_tbl}'); END;"
+    
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        print(sql)
+        cursor.execute(sql)
+    except Exception as e:
+        print(f"reason: {e}")
+        raise
+
+def clean_error_msg(error_msg):
+    msg=str(error_msg)
+    msg=re.sub(r"[\n\r\t]+"," ",msg)
+    msg=re.sub(r"[\"']","",msg)
+    msg=re.sub(r"\s{2,}"," ",msg)
+    return msg.strip()
+
+def fail_task(context):
+    task_instance=context.get('task_instance')
+    exception=context.get('exception')
+    error=clean_error_msg(str(task_instance)+" "+str(exception))+"|Second run with parquet"
+    updt_sql("Dag_Failed",error_message=error,**context)
+    send_email_report("Dag Got Failed",**context)
+    print("DAG execution failed!",error)
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'retries': 0
+}
+
+dag = DAG(
+    # **MODIFIED DAG ID**
+    dag_id=f"history_load_dag__{Table_Name}__daily_{Tbl_Load_Type}_{prj}{job_id}", 
+    default_args=default_args,
+    description='DAG to generate NOS SQL query for Teradata',
+    schedule_interval="00 05 * * *",
+    max_active_runs=1,
+    start_date=datetime(2025, 10, 1,tzinfo=local_tz),
+    catchup=False)
+    
+get_metadata = PythonOperator(
+    task_id='fetch_metadata',
+    python_callable=fetch_metadata,
+    provide_context=True,  # Ensures kwargs include `dag_run`
+    dag=dag,
+    on_failure_callback=fail_task)
+
+check_target_table_existance = PythonOperator(
+    task_id='check_target_table_existance',
+    python_callable=check_table_exists,
+    provide_context=True,  # Ensures kwargs include `dag_run`
+    dag=dag,
+    on_failure_callback=fail_task)
+
+generate_query_task = PythonOperator(
+    task_id='generate_nos_query',
+    python_callable=generate_nos_query,
+    provide_context=True,  # Ensures kwargs include `dag_run`
+    dag=dag,
+    on_failure_callback=fail_task)
+
+nos_to_gcs_load = TeradataOperator(
+    task_id='nos_to_gcs_load',
+    conn_id=functional_id_used,
+    sql="{{ ti.xcom_pull(task_ids='generate_nos_query', key='nos_query') }}",
+    retries=0,
+    dag=dag,
+    on_failure_callback=fail_task,
+)
+
+gcs_to_prod_stg_load=BigQueryInsertJobOperator(
+    task_id='gcs_to_prod_stg_load',
+    configuration={
+        "load":{
+            "sourceUris":[
+                "gs://{{ti.xcom_pull(task_ids='generate_nos_query', key='gcs_bucket') }}/{{ti.xcom_pull(task_ids='generate_nos_query', key='gcs_path') }}/*.parquet"
+            ],
+        "destinationTable":{
+            "projectId":bq_prod_project,
+            "datasetId":"{{ti.xcom_pull(task_ids='fetch_metadata', key='stg_db') }}",
+            "tableId":"{{ti.xcom_pull(task_ids='fetch_metadata', key='stg_tbl') }}"
+        },
+        "sourceFormat":"PARQUET",
+        "autodectect":False,
+        "createDisposition":"CREATE_NEVER",
+        "writeDisposition":"WRITE_TRUNCATE",
+        "allowQuotedNewlines":True
+        }
+    },
+    location='US',
+    gcp_conn_id=GCP_CONN_DO_ID,
+    dag=dag,
+    on_failure_callback=fail_task)
+
+stg_to_bq_prod_load= PythonOperator(
+  task_id='stg_to_bq_prod_load',
+    python_callable=stg_to_tgt_load,
+    provide_context=True,  # Ensures kwargs include `dag_run`
+    dag=dag,
+    on_failure_callback=fail_task)
+
+end=PythonOperator(
+    task_id='end',
+    python_callable=updt_sql_success,
+    dag=dag,
+    provide_context=True,
+    on_failure_callback=fail_task)
+
+get_metadata >> check_target_table_existance >> generate_query_task >> nos_to_gcs_load >> gcs_to_prod_stg_load  >> stg_to_bq_prod_load  >> end

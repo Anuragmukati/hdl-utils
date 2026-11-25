@@ -1,0 +1,507 @@
+import json
+import re
+import pendulum
+import logging
+import time
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.operators.python import BranchPythonOperator
+from airflow.operators.empty import EmptyOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.transfers.bigquery_to_gcs import BigQueryToGCSOperator
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.providers.teradata.operators.teradata import TeradataOperator
+from airflow.hooks.base import BaseHook
+import teradatasql
+import random
+from airflow.exceptions import AirflowFailException
+from google.cloud import storage_transfer
+from airflow.providers.google.cloud.operators.cloud_storage_transfer_service import (
+    CloudDataTransferServiceGCSToGCSOperator,
+)
+
+
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_25/"
+
+def read_config():
+    with open(f'{BASE_DIR}history_load_config_wave_wb.json', 'r') as f:
+        return json.load(f)
+
+config = read_config()
+
+# ── Set project here — all connections and project spaces are derived from this ──
+# Valid projects: cwlndo/zdwvdo//bglodo/bgtsdo/bhubdo/bopsdo/bsopdo/bsyido/factdo/fcredo/ffrado/frvado/aidplt
+project           = "gk1vdo"
+wb_conn_id        = config["wb_conn_id"]
+project_conn_id   = config[f"GCP_CONN_DO_ID_{project}"]
+project_space     = config[f"bq_prod_project_{project}"]
+gcs_bucket        = config[f"gcs_bucket_name_{project}"]
+wb_source_project = config["wb_source_project"]
+sts_conn_id       = config["STS_conn_id"]
+# ─────────────────────────────────────────────────────────────────────────────────
+
+TD_CONN_ID_ALL = ['UWBGCPDTSSLA1','UWBGCPDTSSLA2','UWBGCPDTSSLA3']
+TD_CONN_ID=TD_CONN_ID_ALL[random.randint(0,len(TD_CONN_ID_ALL)-1)]
+Table_Name = "dataset.table"
+dataset="dataset"
+table="table"
+DAG_ID = f"bq2td_writeback_nos_.*"
+
+local_tz = pendulum.timezone("America/New_York")
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2026, 3, 9, tzinfo=local_tz),
+    'retries': 0
+}
+
+
+def get_formatted_bq_query(dataset, table):
+    hook = BigQueryHook(gcp_conn_id=wb_conn_id)
+    client = hook.get_client(project_id=project_space)
+    table_ref = f"{project_space}.{dataset}.{table}"
+    table_obj = client.get_table(table_ref)
+    exprs = []
+    column_names = []
+
+    for field in table_obj.schema:
+        col = field.name
+        dtype = field.field_type.upper()
+        column_names.append(col)
+
+        if dtype == "DATE":
+            exprs.append(f"FORMAT_DATE('%Y-%m-%d', {col}) AS {col}")
+        elif dtype in ("DATETIME", "TIMESTAMP"):
+            exprs.append(f"FORMAT_DATETIME('%Y-%m-%d %H:%M:%S', {col}) AS {col}")
+        elif dtype == "STRING":
+            exprs.append(f"`PROJECT_ID_30`.edw_data_migration_opsstg_tbls.uni_to_lat({col}) AS {col}")
+        else:
+            exprs.append(f"SAFE_CAST({col} AS STRING) AS {col}")
+    query = f"SELECT {', '.join(exprs)} FROM `{table_ref}`"
+    return query, ", ".join(column_names)
+
+def get_td_max_date_raw(max_dt_sql):
+    conn_obj = BaseHook.get_connection(TD_CONN_ID)
+    try:
+        with teradatasql.connect(host=conn_obj.host, user=conn_obj.login, password=conn_obj.password) as con:
+            with con.cursor() as cur:
+                cur.execute(max_dt_sql)
+                row = cur.fetchone()
+                return row[0] if row and row[0] is not None else -1
+    except Exception as e:
+        print(f"TD Max Date Query failed: {e}")
+        return -1
+
+
+def process_metadata_and_prep(**context):
+    ti = context['ti']
+    target_tbl_input = Table_Name
+
+    bq_hook = BigQueryHook(gcp_conn_id=wb_conn_id)
+    audit_query = f"SELECT * FROM `edw_data_migration_audit_tbls.edw_mig_bq_to_td_writeback_metadata` WHERE bq_table_name = '{target_tbl_input}' and app_name='' LIMIT 1"
+    meta_rows = list(bq_hook.get_client(project_id=project_space).query(audit_query).result())
+
+    if not meta_rows:
+        raise ValueError(f"No metadata found for {target_tbl_input}")
+
+    meta = dict(meta_rows[0])
+    ti.xcom_push(key='meta', value=meta)
+
+    ds, tb = target_tbl_input.split('.')
+    bq_query, col_list = get_formatted_bq_query(ds, tb)
+    ti.xcom_push(key='col_list', value=col_list)
+    ti.xcom_push(key='bq_query', value=bq_query)
+
+def prepare_bq_export_query(**context):
+    ti = context['ti']
+    meta = ti.xcom_pull(task_ids='startTask', key='meta')
+    project_nm=meta['project_name']
+    bq_table = meta['bq_table_name']
+    td_db, td_table = meta['td_table_name'].split('.')
+    load_type = meta.get('load_type', 'FULL_LOAD').upper()
+
+    where_condition_used = "1=1"
+    if load_type in ('APPEND', 'DELETE_APPEND'):
+        delta_column = meta.get('delta_column')
+        delta_interval = meta.get('delta_interval')
+        delta_column_type = meta.get('delta_column_type')
+        max_dt_sql = f"SELECT MAX({delta_column}) FROM {td_db}.{td_table}"
+        delta_column_max_value = get_td_max_date_raw(max_dt_sql)
+        where_condition_used=meta.get('where_condition')
+
+        if delta_column_max_value == -1:
+            raise AirflowFailException("No History found for Incremental Load")
+
+        if where_condition_used:
+            if "current_date()" in where_condition_used:
+                try:
+                    max_date = datetime.strptime(str(delta_column_max_value), '%Y-%m-%d').date()
+                    current_date = datetime.now().date()
+
+                    if max_date < current_date:
+                        where_condition_used = where_condition_used.replace("current_date()", f"cast('{delta_column_max_value}' as date)")
+                except ValueError as e:
+                    print(f"Error parsing date: {e}")
+                    raise AirflowFailException("Error in date parsing for where condition")
+
+            where_condition_used=f" {where_condition_used}"
+        elif delta_column and delta_interval:
+            if delta_column_type.lower()=='integer':
+                where_condition_used=f" {delta_column} > cast('{delta_column_max_value}' as  {delta_column_type}) -  {delta_interval}"
+            else:
+                where_condition_used=f" {delta_column} > cast('{delta_column_max_value}' as  {delta_column_type}) - interval '{delta_interval}'"
+        elif delta_column:
+            where_condition_used=f" {delta_column} > '{delta_column_max_value}'"
+        else:
+            print("No Delta Locgic Found")
+            ti.xcom_push(key='td_delta_count',value="0")
+            ti.xcom_push(key='where_condition_used',value="NA")
+            raise AirflowFailException("No Delta logic found")
+
+    # Fetch BQ schema
+    bq_dataset, bq_table_name = bq_table.split('.')
+    bq_hook = BigQueryHook(gcp_conn_id=wb_conn_id)
+    bq_schema_query = f"""
+    SELECT lower(column_name) as column_name, data_type
+    FROM `{project_space}.{bq_dataset}.INFORMATION_SCHEMA.COLUMNS`
+    WHERE table_name = '{bq_table_name}'
+    ORDER BY ordinal_position
+    """
+    bq_columns = {row['column_name']: row['data_type']
+                  for row in bq_hook.get_client(project_id=project_space).query(bq_schema_query).result()}
+
+    # Fetch TD schema
+    td_schema_query = f"""
+    SELECT lower(ColumnName) as ColumnName, ColumnType,ColumnFormat,decimalfractionaldigits
+    FROM `{hdl_project}.edw_data_migration_ops_tbls.dbc_columnsv`
+    WHERE lower(DatabaseName) = lower('{td_db}') AND lower(TableName) = lower('{td_table}')
+    """
+    td_schema_results = list(bq_hook.get_client(project_id=project_space).query(td_schema_query).result())
+    td_columns = {row['ColumnName']: row['ColumnType'] for row in td_schema_results}
+    dec_digits= {row['ColumnName']: row['decimalfractionaldigits'] for row in td_schema_results}
+
+    # Build custom casting expressions
+    select_exprs = []
+    for col_name, bq_type in bq_columns.items():
+        td_type = td_columns.get(col_name, '').upper()
+        bq_base_type = bq_type.split('(')[0].upper()
+        dec_digit = dec_digits.get(col_name, 0)
+        if bq_base_type == 'BIGNUMERIC':
+            if td_type == 'F':  # Float in TD
+                select_exprs.append(f"CAST({col_name} AS FLOAT64) AS {col_name}")
+            else:  # Decimal/Number in TD
+                select_exprs.append(f"CAST({col_name} AS NUMERIC) AS {col_name}")
+        elif bq_base_type == 'NUMERIC':
+            if td_type == 'F':  # Float in TD
+                select_exprs.append(f"CAST({col_name} AS FLOAT64) AS {col_name}")
+            else:
+                select_exprs.append(col_name)
+        elif bq_base_type in ('TIME', 'DATETIME', 'TIMESTAMP'):
+            if td_type == 'AT':  # TIME
+                if int(dec_digit) > 0:
+                    select_exprs.append(f"FORMAT_TIME('%H:%M:%E{dec_digit}S',{col_name} ) AS {col_name}")
+                else:
+                    select_exprs.append(f"FORMAT_TIME('%H:%M:%S',{col_name} ) AS {col_name}")
+            elif td_type in ('TS', 'TZ', 'SZ'):
+                if int(dec_digit) > 0:
+                    select_exprs.append(f"FORMAT_TIMESTAMP('%E4Y-%m-%d %H:%M:%E{dec_digit}S',{col_name} ) AS {col_name}")
+                else:
+                    select_exprs.append(f"FORMAT_TIMESTAMP('%E4Y-%m-%d %H:%M:%S',{col_name} ) AS {col_name}")
+            else:
+                select_exprs.append(f"CAST({col_name} AS STRING) AS {col_name}")
+        else:
+            select_exprs.append(col_name)
+
+    select_clause = ", ".join(select_exprs)
+    final_query = f"SELECT {select_clause} FROM `{project_nm}.{bq_table}` WHERE {where_condition_used}"
+    temp_table = f"{project_space}.edw_data_migration_opsstg_tbls.tmp_{td_db}_{td_table}_{context['ds_nodash']}"
+
+    BigQueryHook(gcp_conn_id=wb_conn_id).run_query(
+        sql=f"CREATE OR REPLACE TABLE `{temp_table}` AS {final_query}",
+        use_legacy_sql=False
+    )
+    ti.xcom_push(key='export_source_table', value=temp_table)
+    ti.xcom_push(key='where_condition_used', value=where_condition_used)
+
+def generate_teradata_load_sql(**context):
+    ti = context['ti']
+    meta = ti.xcom_pull(task_ids='startTask', key='meta')
+    where_condition_used = ti.xcom_pull(task_ids='prepare_bq_export', key='where_condition_used')
+    col_list = ti.xcom_pull(task_ids='startTask',key='col_list')
+    td_db, td_table = meta['td_table_name'].split('.')
+    stg_db = "WIRELESS_WRITEBACK"
+    load_type = meta.get('load_type').upper()
+
+    # Fetch TD schema for proper casting
+    bq_hook = BigQueryHook(gcp_conn_id=wb_conn_id)
+    td_schema_query = f"""
+    SELECT lower(ColumnName) as ColumnName, ColumnType, ColumnFormat, DecimalFractionalDigits, DecimalTotalDigits
+    FROM `{hdl_project}.edw_data_migration_ops_tbls.dbc_columnsv`
+    WHERE lower(DatabaseName) = lower('{td_db}') AND lower(TableName) = lower('{td_table}')
+    """
+    td_schema_results = list(bq_hook.get_client(project_id=project_space).query(td_schema_query).result())
+    td_columns = {row['ColumnName']: {
+        'type': row['ColumnType'],
+        'format': row.get('ColumnFormat', ''),
+        'dec_digit': row.get('DecimalFractionalDigits', 0),
+        'dec_total': row.get('DecimalTotalDigits', 0)
+    } for row in td_schema_results}
+
+    # Build cast expressions for foreign table to stage table
+    cast_exprs = []
+    for col_name in col_list.split(', '):
+        col_name_lower = col_name.strip().lower()
+        td_info = td_columns.get(col_name_lower, {})
+        td_type = td_info.get('type', '').upper()
+        td_format = td_info.get('format', '')
+        dec_digit = td_info.get('dec_digit', 0)
+
+        if td_type in ['AT', 'TS', 'TZ', 'SZ']:  # TIME or TIMESTAMP
+            if td_type == 'AT':
+                if dec_digit and dec_digit > 0:
+                    cast_exprs.append(f"CAST({col_name} AS TIME({dec_digit})) AS {col_name}")
+                else:
+                    cast_exprs.append(f"CAST({col_name} AS TIME(0)) AS {col_name}")
+            else:
+                if dec_digit and dec_digit > 0:
+                    cast_exprs.append(f"CAST({col_name} AS TIMESTAMP({dec_digit})) AS {col_name}")
+                else:
+                    cast_exprs.append(f"CAST({col_name} AS TIMESTAMP(0)) AS {col_name}")
+        elif td_type == 'DA':  # DATE
+            cast_exprs.append(f"CAST({col_name} AS DATE) AS {col_name}")
+        else:
+            cast_exprs.append(col_name)
+
+    td_cast_clause = ", ".join(cast_exprs)
+
+    if load_type == 'FULL_LOAD':
+        load_stg = f"DELETE FROM {stg_db}.{td_table} ALL; \n INSERT INTO {stg_db}.{td_table} ({col_list})  SELECT {td_cast_clause} FROM {stg_db}.{td_table}_ft;"
+        target_action = f"DELETE FROM {td_db}.{td_table} ALL; \n INSERT INTO {td_db}.{td_table} ({col_list}) SELECT {col_list} FROM {stg_db}.{td_table};"
+    elif load_type == 'APPEND':
+        load_stg = f"DELETE FROM {stg_db}.{td_table}; INSERT INTO {stg_db}.{td_table} ({col_list}) SELECT {td_cast_clause} FROM {stg_db}.{td_table}_ft;"
+        target_action = f"DELETE FROM {td_db}.{td_table} where {where_condition_used}; \n INSERT INTO {td_db}.{td_table} ({col_list}) SELECT {col_list} FROM {stg_db}.{td_table};"
+    elif load_type == 'DELETE_APPEND':
+        load_stg = f"""BT;
+        DELETE FROM {stg_db}.{td_table} ;
+        INSERT INTO {stg_db}.{td_table} ({col_list}) SELECT {td_cast_clause} FROM {stg_db}.{td_table}_ft;
+        ET;
+        """
+        target_action = f""" BT;
+        DELETE FROM {td_db}.{td_table} WHERE {where_condition_used};
+        INSERT INTO {td_db}.{td_table} ({col_list}) SELECT {col_list} FROM {stg_db}.{td_table};
+        ET;
+        """
+    else:
+        raise AirflowFailException(f"Unsupported load type: {load_type}")
+
+    ti.xcom_push(key='load_stg_sql', value=load_stg)
+    ti.xcom_push(key='target_action_sql', value=target_action)
+
+
+def check_stage_table_count(**context):
+    ti = context['ti']
+    meta = ti.xcom_pull(task_ids='startTask', key='meta')
+    td_db, td_table = meta['td_table_name'].split('.')
+    stg_db = "WIRELESS_WRITEBACK"
+
+    count_sql = f"SELECT CAST(COUNT(*) AS BIGINT) FROM {stg_db}.{td_table}"
+    conn_obj = BaseHook.get_connection(TD_CONN_ID)
+
+    try:
+        with teradatasql.connect(host=conn_obj.host, user=conn_obj.login, password=conn_obj.password) as con:
+            with con.cursor() as cur:
+                cur.execute(count_sql)
+                row = cur.fetchone()
+                stage_count = row[0] if row else 0
+                ti.xcom_push(key='stage_count', value=stage_count)
+                print(f"Stage table {stg_db}.{td_table} has {stage_count} rows")
+
+                if stage_count > 0:
+                    return 'execute_target_load'
+                else:
+                    print("Stage table is empty. Skipping target load.")
+                    return 'skip_target_load'
+    except Exception as e:
+        print(f"Stage table count check failed: {e}")
+        raise AirflowFailException(f"Failed to check stage table count: {e}")
+
+
+def export_bq_to_gcs(**context):
+    ti = context['ti']
+    meta = ti.xcom_pull(task_ids='startTask', key='meta')
+    export_source_table = ti.xcom_pull(task_ids='prepare_bq_export', key='export_source_table')
+    td_db, td_table = meta['td_table_name'].split('.')
+    bq_table = meta['bq_table_name']
+    bq_dataset, bq_table_name = bq_table.split('.')
+
+    bq_hook = BigQueryHook(gcp_conn_id=wb_conn_id)
+    bq_schema_query = f"""
+    SELECT lower(column_name) as column_name, data_type
+    FROM `{project_space}.{bq_dataset}.INFORMATION_SCHEMA.COLUMNS`
+    WHERE table_name = '{bq_table_name}'
+    """
+    bq_columns = {row['column_name']: row['data_type']
+                  for row in bq_hook.get_client(project_id=project_space).query(bq_schema_query).result()}
+
+    td_schema_query = f"""
+    SELECT lower(ColumnName) as ColumnName, ColumnType, ColumnFormat,decimalfractionaldigits
+    FROM `{hdl_project}.edw_data_migration_ops_tbls.dbc_columnsv`
+    WHERE lower(DatabaseName) = lower('{td_db}') AND lower(TableName) = lower('{td_table}')
+    """
+    td_schema_results = list(bq_hook.get_client(project_id=project_space).query(td_schema_query).result())
+    td_columns = {row['ColumnName']: {'type': row['ColumnType'], 'format': row.get('ColumnFormat', ''),'decdigit':row['decimalfractionaldigits']}
+                  for row in td_schema_results}
+
+    print(td_columns, bq_columns)
+    select_exprs = []
+    for col_name, bq_type in bq_columns.items():
+        td_info = td_columns.get(col_name, {})
+        td_type = td_info.get('type', '').upper()
+        td_format = td_info.get('format', '')
+        td_col_dec_digit = td_info.get('decdigit', '')
+
+        bq_base_type = bq_type.split('(')[0].upper()
+
+        if bq_base_type == 'BIGNUMERIC':
+            if td_type == 'F':
+                select_exprs.append(f"CAST({col_name} AS FLOAT64) AS {col_name}")
+            else:
+                select_exprs.append(f"CAST({col_name} AS NUMERIC) AS {col_name}")
+        elif bq_base_type == 'NUMERIC':
+            if td_type == 'F':
+                select_exprs.append(f"CAST({col_name} AS FLOAT64) AS {col_name}")
+            else:
+                select_exprs.append(col_name)
+        elif bq_base_type == 'FLOAT64':
+            if td_type == 'F':
+                select_exprs.append(f"CAST({col_name} AS FLOAT64) AS {col_name}")
+            else:
+                select_exprs.append(col_name)
+        elif bq_base_type in ('TIME','DATETIME'):
+                select_exprs.append(f"CAST({col_name} AS STRING) AS {col_name}")
+        else:
+            select_exprs.append(col_name)
+
+    select_clause = ", ".join(select_exprs)
+
+    gcs_uri = f"gs://{gcs_bucket}/{td_table}/data/*.parquet"
+
+    export_sql = f"""
+    EXPORT DATA OPTIONS(
+        uri='{gcs_uri}',
+        format='PARQUET',
+        overwrite=true
+    ) AS
+    SELECT {select_clause} FROM `{export_source_table}`
+    """
+
+    BigQueryHook(gcp_conn_id=wb_conn_id).run_query(
+        sql=export_sql,
+        use_legacy_sql=False
+    )
+    print(f"Data exported to {gcs_uri}")
+
+def check_dag_status(**context):
+    """Check if any upstream tasks failed and raise exception to fail the DAG"""
+    ti = context['ti']
+    dag_run = context['dag_run']
+
+    failed_tasks = []
+    skipped_critical_tasks = []
+
+    for task_instance in dag_run.get_task_instances():
+        if task_instance.state == 'failed' and task_instance.task_id != 'final_status_check':
+            failed_tasks.append(task_instance.task_id)
+        # Check if execute_target_load was skipped (meaning no data to load)
+        if task_instance.task_id == 'execute_target_load' and task_instance.state == 'skipped':
+            skipped_critical_tasks.append(task_instance.task_id)
+
+    if failed_tasks:
+        raise AirflowFailException(f"DAG failed due to failed tasks: {', '.join(failed_tasks)}")
+
+    if skipped_critical_tasks:
+        raise AirflowFailException(f"DAG failed because target load was skipped (no data to load): {', '.join(skipped_critical_tasks)}")
+
+    print("All tasks completed successfully")
+
+with DAG(DAG_ID, schedule_interval=None, catchup=False, default_args=default_args, max_active_runs=1) as dag:
+
+    startTask = PythonOperator(
+        task_id="startTask",
+        python_callable=process_metadata_and_prep
+    )
+
+    nos_gcs_archival_deletion_process_sts = CloudDataTransferServiceGCSToGCSOperator(
+        task_id="nos_gcs_archival_deletion_process_sts",
+        source_bucket=gcs_bucket,
+        source_path="{{ ti.xcom_pull(task_ids='startTask', key='meta')['td_table_name'].split('.')[1] }}/data/",
+        destination_bucket=gcs_bucket,
+        destination_path="archive/{{ ti.xcom_pull(task_ids='startTask', key='meta')['td_table_name'].split('.')[1] }}/data/",
+        project_id=project_space_pr,
+        gcp_conn_id=wb_conn_id_pr,
+        transfer_options={
+            "deleteObjectsFromSourceAfterTransfer": True,
+            "overwriteObjectsAlreadyExistingInSink": True,
+        },
+        description="Archive files from data to archive location",
+        wait=True,
+        timeout=7200,
+    )
+
+    prepare_bq_export = PythonOperator(
+        task_id="prepare_bq_export",
+        python_callable=prepare_bq_export_query
+    )
+
+    bq_to_gcs = PythonOperator(
+        task_id="bq_to_gcs",
+        python_callable=export_bq_to_gcs
+    )
+
+    generate_load_sql = PythonOperator(
+        task_id="generate_load_sql",
+        python_callable=generate_teradata_load_sql
+    )
+
+    execute_teradata_load = TeradataOperator(
+        task_id="execute_teradata_load",
+        conn_id=TD_CONN_ID,
+        sql="{{ ti.xcom_pull(task_ids='generate_load_sql', key='load_stg_sql') }}"
+    )
+
+    check_stage_count = BranchPythonOperator(
+        task_id="check_stage_count",
+        python_callable=check_stage_table_count
+    )
+
+    skip_target_load = EmptyOperator(
+        task_id="skip_target_load"
+    )
+
+    execute_target_load = TeradataOperator(
+        task_id="execute_target_load",
+        conn_id=TD_CONN_ID,
+        sql="{{ ti.xcom_pull(task_ids='generate_load_sql', key='target_action_sql') }}"
+    )
+
+    cleanup_bq_temp_table = PythonOperator(
+        task_id="cleanup_bq_temp_table",
+        python_callable=lambda **context: BigQueryHook(gcp_conn_id=wb_conn_id).run_query(
+            sql=f"DROP TABLE `{context['ti'].xcom_pull(task_ids='prepare_bq_export', key='export_source_table')}`",
+            use_legacy_sql=False
+        ),
+        trigger_rule="all_done"
+    )
+
+    final_status_check = PythonOperator(
+        task_id="final_status_check",
+        python_callable=check_dag_status,
+        trigger_rule="all_done"
+    )
+
+
+    startTask >> nos_gcs_archival_deletion_process_sts >> prepare_bq_export >> bq_to_gcs >> generate_load_sql >> execute_teradata_load >> check_stage_count
+    check_stage_count >> execute_target_load >> cleanup_bq_temp_table >> final_status_check
+    check_stage_count >> skip_target_load >> cleanup_bq_temp_table >> final_status_check

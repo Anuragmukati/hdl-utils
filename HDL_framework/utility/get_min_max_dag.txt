@@ -1,0 +1,149 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowFailException,AirflowSkipException
+from airflow.providers.teradata.operators.teradata import TeradataOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryHook,BigQueryInsertJobOperator
+from google.cloud.exceptions import NotFound
+from airflow.hooks.base import BaseHook
+
+import json
+from datetime import datetime
+import teradatasql
+from datetime import datetime
+import sys
+import random
+import re
+import time
+
+def read_config():
+    with open('/home/airflow/gcs/dags/PROJECT_ID_130/history_load_config_prod_hdl.json', 'r') as f:
+        confid_details = json.load(f)
+    return confid_details
+
+# gcs details
+config = read_config()
+prj='gk1vdo'
+App_Name='Gk1vdo_p2'
+# gcs details
+GCP_CONN_DO_ID = config[f"GCP_CONN_DO_ID_{prj}"]
+GCP_CONN_DO_ID_PLE = config[f"GCP_CONN_DO_ID_PLE_{prj}"]
+GCS_BUCKET = config["GCS_BUCKET"]
+GCS_PREFIX = config["GCS_PREFIX"]
+Audit_db=config["Audit_Dataset"]
+Metadata_db=config["Metadata_Dataset"]
+Metadata_tbl=config["Metadata_Tbl"]
+Audit_tbl=config["Audit_Table"]
+Queue_Table=str(config["Queue_Table_large"])+"_Small_P"
+bq_prod_project=config[f"bq_prod_project_{prj}"]
+bq_ple_project=config[f"bq_ple_project_{prj}"]
+HDL_project=config["hdl_source_project"]
+hdl_source_connection_id=config["hdl_source_connection_id"]
+function_ids=config["function_ids"]
+functional_id_used=function_ids[random.randint(0,len(function_ids)-1)]
+
+def generate_query(**kwargs):
+    
+    #### Hitting Teradata and extracting data into GCS files
+    ti = kwargs['ti']
+    tbl_nm=kwargs['dag_run'].conf.get('table_name')
+    col_name = kwargs['dag_run'].conf.get('column_name')
+
+    
+    #### Creating NOS SQL Query for Reading Data.
+    sql_query = f"""
+    SELECT MIN({col_name}) as min_val, MAX({col_name}) as max_val,cast(count(*) as bigint) as cnt FROM {tbl_nm};
+    """
+
+    ti.xcom_push(key='query', value=sql_query)
+    # ti.xcom_push(key='gcs_path',value=gcs_path)
+    # ti.xcom_push(key='gcs_bucket',value=gcs_bucket)
+    print("Generated Query:", sql_query)
+
+
+def clean_error_msg(error_msg):
+    msg=str(error_msg)
+    msg=re.sub(r"[\n\r\t]+"," ",msg)
+    msg=re.sub(r"[\"']","",msg)
+    msg=re.sub(r"\s{2,}"," ",msg)
+    return msg.strip()
+
+
+def fail_task(context):
+    task_instance=context.get('task_instance')
+    exception=context.get('exception')
+    error=clean_error_msg(str(task_instance)+" "+str(exception))
+    print("DAG execution failed!",error)
+
+
+
+
+
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 4, 9),
+    'retries': 0
+}
+
+dag = DAG(
+    dag_id=f"get_min_max_dag",
+    default_args=default_args,
+    description='DAG to get Min, Max values of column in Teradata',
+    # schedule_interval='*/1 * * * *',
+    max_active_runs=5,
+    catchup=False,
+    params={
+        "table_name": None,
+        "column_name": "LAST_UPD_DT",
+    },
+)
+
+
+def run_td_sql(sql):
+    conn=BaseHook.get_connection(functional_id_used)
+    try:
+        #password = access_secret_version("td_pwd")
+        
+        
+        connection =teradatasql.connect(
+            host=conn.host,
+            user=conn.login,
+            password=conn.password
+        )
+
+        cursor = connection.cursor()
+        
+        print("sql: ",sql)
+        cursor.execute(sql)
+        count = cursor.fetchone()
+        cursor.close()
+        connection.close()
+        return count
+
+    except Exception as e:
+        print(f"**** Error while getting Min,Max for table: {str(e)}")
+        return -1
+
+
+generate_query_task = PythonOperator(
+    task_id='generate_query',
+    python_callable=generate_query,
+    provide_context=True,  # Ensures kwargs include `dag_run`
+    dag=dag,
+    on_failure_callback=fail_task
+)
+
+execute_sql = PythonOperator(
+    task_id='execute_sql',
+    python_callable=run_td_sql,
+    op_args=["{{ ti.xcom_pull(task_ids='generate_query', key='query') }}"],
+    provide_context=True,  # Ensures kwargs include `dag_run`
+    dag=dag,
+    on_failure_callback=fail_task
+)
+
+
+
+
+generate_query_task >> execute_sql 

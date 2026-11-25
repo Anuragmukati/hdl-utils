@@ -1,0 +1,749 @@
+import json
+import os
+import re
+import zipfile
+import tempfile
+import random
+import teradatasql
+from datetime import datetime, timezone, timedelta
+from airflow import DAG
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+from airflow.hooks.base import BaseHook
+from airflow.exceptions import AirflowFailException
+from airflow.utils.email import send_email
+
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_25/"
+
+def read_config():
+    with open(f'{BASE_DIR}history_load_config_wave_wb.json', 'r') as f:
+        return json.load(f)
+
+config = read_config()
+
+# ── Set project here — all connections and project spaces are derived from this ──
+# Valid projects: zdwvdo/zdwvbizdo/coasdo/bglodo/bgtsdo/bhubdo/bopsdo/bsopdo/bsyido
+#                 factdo/fcredo/ffrado/frvado/vcgfdofbi/vcgfdofnv/vcgfdocfc/vcgfdorbi
+project            = "zdwvdo"
+BQ_CONN_ID         = config[f"GCP_CONN_DO_ID_{project}"]
+BQ_PROJECT         = config[f"bq_prod_project_{project}"]
+dag_folder         = config[f"dag_folder_{project}"]
+gcs_bucket         = config[f"gcs_bucket_name_{project}"]
+gcs_archival_bucket= config["gcs_archival_bucket"]
+composer_bucket    = config["composer_bucket"]
+# ─────────────────────────────────────────────────────────────────────────────────
+
+# Derive framework conn alias from dag_folder: "PROJECT_ID_25" → "zdwv-edwdo"
+_parts         = dag_folder.split('-')
+gcp_conn_alias = f"{_parts[-3]}-{_parts[-2]}"         # e.g. "zdwv-edwdo"
+gcp_conn_id_alias = f"gcp_conn_id_{gcp_conn_alias}"   # e.g. "gcp_conn_id_zdwv-edwdo"
+
+TD_CONN_ID_ALL = ['UWBGCPDTSSLA1', 'UWBGCPDTSSLA2', 'UWBGCPDTSSLA3']
+TD_CONN_ID     = TD_CONN_ID_ALL[random.randint(0, len(TD_CONN_ID_ALL) - 1)]
+
+BQ_METADATA_TABLE = f"{BQ_PROJECT}.edw_data_migration_audit_tbls.edw_mig_bq_to_td_writeback_metadata"
+
+# load_instances range that identifies tables handled by this generator
+LOAD_INSTANCES_MIN = 0
+LOAD_INSTANCES_MAX = 9
+
+# TPT session defaults (min_sessions/max_sessions removed from metadata schema)
+MIN_SESSIONS = "2"
+MAX_SESSIONS = "16"
+
+DAG_ID = f"writeback_dag_generation_utility_{project}"
+
+
+# --- Helper Functions: Formats & SQL Generation ---
+
+def translate_td_format_to_bq(td_format):
+    if not td_format:
+        return None
+    fmt = td_format.upper()
+    if fmt == 'DD-MMM-YY':
+        return '%d-%b-%y'
+    fmt = fmt.replace('YYYY', '%Y').replace('YY', '%y').replace('MM', '%m').replace('DD', '%d')
+    return None if fmt in ['%Y-%m-%d', '%Y/%m/%d'] else fmt
+
+
+def get_td_column_formats(database_name, table_name):
+    conn = BaseHook.get_connection(TD_CONN_ID)
+    col_formats = {}
+    query = (
+        f"SELECT ColumnName, ColumnFormat FROM DBC.ColumnsV "
+        f"WHERE DatabaseName = '{database_name}' AND TableName = '{table_name}' "
+        f"AND ColumnFormat IS NOT NULL"
+    )
+    try:
+        with teradatasql.connect(host=conn.host, user=conn.login, password=conn.password) as con:
+            with con.cursor() as cur:
+                cur.execute(query)
+                for row in cur.fetchall():
+                    bq_fmt = translate_td_format_to_bq(row[1].strip())
+                    if bq_fmt:
+                        col_formats[row[0].strip().upper()] = bq_fmt
+    except Exception as e:
+        print(f"Warning: Could not fetch formats: {e}")
+        return {}
+    return col_formats
+
+
+def build_select_query_and_columns(client, dataset_id, table_id, td_format_map, td_format_map_sel, project_id):
+    table = client.get_table(f"{dataset_id}.{table_id}")
+    select_exprs, column_names, custom_format_sel_agg = [], [], []
+    for field in table.schema:
+        col, dtype = field.name, field.field_type.upper()
+        column_names.append(col)
+        custom_format = td_format_map.get(col.upper())
+        custom_format_sel_agg.append(f"{col} AT 'GMT' AS {col}" if dtype in ['DATETIME', 'TIMESTAMP'] else col)
+
+        if dtype == "STRING":
+            expr = f"`{project_id}`.edw_data_migration_opsstg_tbls.uni_to_lat(COLLATE(`{col}`, '')) AS `{col}`"
+        elif dtype == "DATE":
+            expr = (
+                f"FORMAT_DATE('{custom_format}', `{col}`) AS `{col}`" if custom_format
+                else f"PARSE_DATE('%Y-%m-%d', CAST(`{col}` AS STRING)) AS `{col}`"
+            )
+        elif dtype in ["DATETIME", "TIMESTAMP"]:
+            expr = f"FORMAT_DATETIME('%Y-%m-%d %H:%M:%E*S', `{col}`) AS `{col}`"
+        else:
+            expr = f"SAFE_CAST(`{col}` AS STRING) AS `{col}`"
+        select_exprs.append(expr)
+
+    query = f"SELECT {', '.join(select_exprs)} FROM `{dataset_id}.{table_id}`"
+    comma_separated_cols = ", ".join(f'"{c}"' for c in column_names)
+    custom_format_sel_agg_final = ", ".join(custom_format_sel_agg)
+    return query, comma_separated_cols, custom_format_sel_agg_final
+
+
+def build_select_query_and_columns_nos(client, td_database, td_table, bq_project, bq_dataset, bq_table):
+    table_ref = f"{bq_project}.{bq_dataset}.{bq_table}"
+    bq_meta = {field.name.upper(): field.field_type.upper() for field in client.get_table(table_ref).schema}
+    conn = BaseHook.get_connection(TD_CONN_ID)
+    with teradatasql.connect(host=conn.host, user=conn.login, password=conn.password) as connect:
+        with connect.cursor() as cursor:
+            cursor.execute(
+                f"SELECT ColumnName, ColumnType, DecimalFractionalDigits FROM DBC.ColumnsV "
+                f"WHERE DatabaseName = '{td_database.upper()}' AND TableName = '{td_table.upper()}' "
+                f"ORDER BY ColumnId;"
+            )
+            bq_select_exprs, td_select_exprs, col_names = [], [], []
+            for row in cursor.fetchall():
+                col_name  = row[0].strip()
+                col_type  = row[1].strip()
+                precision = row[2] if row[2] is not None else 6
+                bq_type   = bq_meta.get(col_name.upper(), "")
+                col_names.append(col_name)
+
+                if col_type in ['TS', 'SZ', 'TZ'] and precision > 0 and bq_type.upper() in ('TIMESTAMP', 'DATETIME'):
+                    td_expr = f"CASE WHEN \"{col_name}\" IS NULL THEN NULL ELSE CAST(\"{col_name}\" AS TIMESTAMP({precision})) END"
+                    bq_expr = f"CAST(FORMAT_DATETIME('%E4Y-%m-%d %H:%M:%E{precision}S', `{col_name}`) AS STRING) AS `{col_name}`"
+                elif col_type in ['TS', 'SZ', 'TZ'] and precision == 0 and bq_type.upper() in ('TIMESTAMP', 'DATETIME'):
+                    td_expr = f"CASE WHEN \"{col_name}\" IS NULL THEN NULL ELSE CAST(\"{col_name}\" AS TIMESTAMP(0)) END"
+                    bq_expr = f"CAST(FORMAT_DATETIME('%E4Y-%m-%d %H:%M:%S', `{col_name}`) AS STRING) AS `{col_name}`"
+                elif col_type == 'AT' and precision > 0 and bq_type.upper() in ['TIME']:
+                    td_expr = f"CASE WHEN \"{col_name}\" IS NULL THEN NULL ELSE CAST(\"{col_name}\" AS TIME({precision})) END"
+                    bq_expr = f"CAST(FORMAT_TIME('%H:%M:%E{precision}S', `{col_name}`) AS STRING) AS `{col_name}`"
+                elif col_type == 'AT' and precision == 0 and bq_type.upper() in ['TIME']:
+                    td_expr = f"CASE WHEN \"{col_name}\" IS NULL THEN NULL ELSE CAST(\"{col_name}\" AS TIME(0)) END"
+                    bq_expr = f"CAST(FORMAT_TIME('%H:%M:%S', `{col_name}`) AS STRING) AS `{col_name}`"
+                elif col_type == 'F' and bq_type.upper() in ['BIGNUMERIC', 'NUMERIC']:
+                    td_expr = f'"{col_name}"'
+                    bq_expr = f"CAST(`{col_name}` AS FLOAT64) AS `{col_name}`"
+                elif col_type in ['D', 'N'] and bq_type.upper() == 'BIGNUMERIC':
+                    td_expr = f'"{col_name}"'
+                    bq_expr = f"CAST(`{col_name}` AS NUMERIC) AS `{col_name}`"
+                elif col_type in ['D', 'N'] and bq_type.upper() == 'NUMERIC':
+                    td_expr = f'"{col_name}"'
+                    bq_expr = f"CAST(`{col_name}` AS NUMERIC) AS `{col_name}`"
+                elif col_type == 'CO' and bq_type.upper() in ['STRING']:
+                    td_expr = f"CAST(\"{col_name}\" AS VARCHAR(30000)) AS \"{col_name}\""
+                    bq_expr = f"CAST(`{col_name}` AS STRING) AS `{col_name}`"
+                elif col_type in ['I1', 'I2', 'I', 'I4', 'I8'] and bq_type.upper() in ['TIME']:
+                    td_expr = f"CAST(\"{col_name}\" AS INTEGER) AS \"{col_name}\""
+                    bq_expr = f"CAST(FORMAT_TIME('%H%M%S', `{col_name}`) AS INTEGER) AS `{col_name}`"
+                else:
+                    td_expr = f'"{col_name}"'
+                    bq_expr = f"`{col_name}` AS `{col_name}`"
+
+                td_select_exprs.append(td_expr)
+                bq_select_exprs.append(bq_expr)
+
+            return (
+                f"SELECT {', '.join(bq_select_exprs)} FROM `{table_ref}`",
+                f"SELECT {', '.join(td_select_exprs)} FROM WIRELESS_WRITEBACK.{td_database}_{td_table}_ft",
+                ", ".join(col_names)
+            )
+
+
+# --- Incremental Python DAG Deployment ---
+
+def deploy_incremental_dag(full_table_path, schedule, td_tsl_query, gcp_tls_sql_query):
+    gcs_hook = GCSHook(gcp_conn_id=BQ_CONN_ID)
+    source_blob = "dags/PROJECT_ID_25/Template/writeback_dag_template.txt"
+    dataset, table = full_table_path.split('.')
+    new_dag_id = f"dg_{project}_bq2td_incremental_load_{dataset}_{table}"
+    code = gcs_hook.download(composer_bucket, source_blob).decode('utf-8')
+    code = re.sub(r'^project\s*=\s*"[^"]*"', f'project = "{project}"', code, flags=re.MULTILINE)
+    code = (code
+            .replace('Table_Name = "dataset.table"', f'Table_Name = "{full_table_path}"')
+            .replace('dataset="dataset"', f'dataset="{dataset}"')
+            .replace('table="table"', f'table="{table}"')
+            .replace('td_tsl_query="td_tsl_query"', f'td_tsl_query="{td_tsl_query}"')
+            .replace('gcp_tls_sql_query="gcp_tls_sql_query"', f'gcp_tls_sql_query="{gcp_tls_sql_query}"'))
+    code = re.sub(r'DAG_ID = f"bq2td_writeback_nos_.*"', f'DAG_ID = "{new_dag_id}"', code)
+    if schedule not in [None]:
+        code = code.replace('schedule_interval=None', f"schedule_interval={schedule}")
+    temp_path = os.path.join(tempfile.gettempdir(), f"{new_dag_id}.py")
+    with open(temp_path, "w") as f:
+        f.write(code)
+    return temp_path
+
+
+# --- Main Generation Function ---
+
+def generate_jsons_and_email(**context):
+    params = context["params"]
+    target_email = params.get("Email_Id")
+    if not target_email or "example.com" not in target_email.lower():
+        raise AirflowFailException(f"Invalid email: {target_email}. Only company addresses allowed.")
+
+    delimiter  = params.get("delimeter", "^")
+    export_del = "" if delimiter == "CNTRLA" else (delimiter if delimiter != "\x02" else "\x02")
+    tpt_del    = "02" if delimiter == "\x02" else delimiter
+
+    tables           = context["dag_run"].conf.get("BQ_Table_List", [])
+    td_tsl_query     = context["dag_run"].conf.get("td_tsl_query", params["td_tsl_query"])
+    gcp_tls_sql_query= context["dag_run"].conf.get("gcp_tls_sql_query", '')
+    if td_tsl_query is None:      td_tsl_query = 'NA'
+    if gcp_tls_sql_query is None: gcp_tls_sql_query = 'NA'
+    td_tls  = td_tsl_query.upper()      not in [None, 'NA', 'N/A', 'NULL']
+    gcp_tls = gcp_tls_sql_query.upper() not in [None, 'NA', 'N/A', 'NULL']
+
+    bq_hook    = BigQueryHook(gcp_conn_id=BQ_CONN_ID, use_legacy_sql=False)
+    client     = bq_hook.get_client(project_id=BQ_PROJECT, location="US")
+    src_bq_hook= BigQueryHook(gcp_conn_id=BQ_CONN_ID, use_legacy_sql=False)
+
+    attachments, py_deployed_log = [], []
+    temp_dir = tempfile.gettempdir()
+
+    for tbl in tables:
+        try:
+            ds_id, tb_id = tbl.split(".", 1)
+            meta_rows = list(client.query(
+                f"SELECT * FROM `{BQ_METADATA_TABLE}` "
+                f"WHERE bq_table_name = '{tbl}' "
+                f"AND load_instances BETWEEN {LOAD_INSTANCES_MIN} AND {LOAD_INSTANCES_MAX} "
+                f"AND app_name = '{project}'"
+            ).result())
+            if not meta_rows:
+                print(f"No metadata found for {tbl} in range [{LOAD_INSTANCES_MIN},{LOAD_INSTANCES_MAX}], skipping.")
+                continue
+            meta = meta_rows[0]
+
+            td_ds, td_tb       = meta.td_table_name.split(".")
+            project_nm         = meta.project_name
+            src_client         = src_bq_hook.get_client(project_id=project_nm, location="US")
+            td_fmt_map         = get_td_column_formats(td_ds, td_tb)
+            load_type          = meta.load_type
+            load_functionality = meta.load_functionality
+            functional_id      = meta.function_id.lower()
+            schedule           = str(meta.schedule)
+            composer           = str(meta.writeback_composer_instance)
+            bq_dataset         = meta.bq_table_name.split(".")[0]
+            bq_table           = meta.bq_table_name.split(".")[1]
+            td_dataset         = meta.td_table_name.split(".")[0]
+            td_table_nm        = meta.td_table_name.split(".")[1]
+
+            # table_owner removed from schema — omit from tags
+            # min/max sessions removed from schema — use defaults
+            min_sess = MIN_SESSIONS
+            max_sess = MAX_SESSIONS
+
+            if gcp_tls:
+                gcp_tls_sql_query1 = gcp_tls_sql_query.replace("var_tb_id", tb_id).replace("var_ds_id", ds_id)
+            else:
+                gcp_tls_sql_query1 = 'select 1'
+            if td_tls:
+                td_tsl_query1 = td_tsl_query.replace("var_tb_id", tb_id).replace("var_ds_id", ds_id)
+            else:
+                td_tsl_query1 = 'select 1'
+
+            # Incremental NOS → deploy Python DAG
+            if load_functionality == "NOS" and load_type in ["APPEND", "DELETE_APPEND"]:
+                attachments.append(deploy_incremental_dag(tbl, schedule, td_tsl_query, gcp_tls_sql_query))
+                py_deployed_log.append(f"{meta.td_table_name} (Python DAG Deployed)")
+                continue
+
+            # Full Load — build schema expressions
+            query, cols, custom_format_sel = build_select_query_and_columns(
+                src_client, ds_id, tb_id, td_fmt_map, td_fmt_map, project_nm
+            )
+            query_nos, cols_nos, custom_format_sel_nos = build_select_query_and_columns_nos(
+                src_client, td_ds, td_tb, project_nm, ds_id, tb_id
+            )
+
+            common_tags = [
+                f"gcp_project:{project_nm}",
+                "lob:vcg",
+                "sub_lob:wireless",
+                "module:bq2td_writeback",
+                f"td_table_name:{meta.td_table_name}",
+                f"bq_table_name:{meta.bq_table_name}",
+                f"project:{gcp_conn_alias}"
+            ]
+
+            common_header = {
+                "Name": f"bq2td_{td_dataset}_{td_table_nm}",
+                "Type": "Batch",
+                "Start_Date": str(datetime.now(timezone.utc) - timedelta(days=1)),
+                "composer": composer,
+                "dagrun_timeout": 7200,
+                "Schedule_interval": schedule,
+                "max_active_runs": "1",
+                "Timezone": "EST",
+                "Catchup": "False",
+                "is_paused_upon_creation": "True",
+                "custom_tags": common_tags,
+                "Project_space": BQ_PROJECT
+            }
+
+            if load_functionality == "TPT":
+                row = {
+                    **common_header,
+                    "custom_tags": common_tags + ["load_type:tpt_full_load"],
+                    "Steps": [
+                        {
+                            "Name": "Start", "Id": "start",
+                            "Description": "Starting point of the dag",
+                            "OkTo": "check_table_load_status"
+                        },
+                        {
+                            "Name": "check_table_load_status", "Id": "check_table_load_status",
+                            "Description": "Validate BQ table freshness",
+                            "Type": "run sql query from file",
+                            "retries": "3", "retryDelay": "minutes=15",
+                            "Params": {
+                                "hook": {
+                                    "gcp_conn_id": gcp_conn_id_alias,
+                                    "query": f"BEGIN IF NOT EXISTS ( {gcp_tls_sql_query1} ) THEN RAISE USING MESSAGE = 'ERROR: Table {bq_table} has not been refreshed in current DAY'; END IF; END;",
+                                    "projectId": gcp_conn_alias.replace('-', '_'),
+                                    "useLegacySql": "false"
+                                },
+                                "obs": {
+                                    "sub_process": "bqTransformLoad", "keyvalue": "NA",
+                                    "project_name": "EDW_MODERNIZATION", "source_type": "Table",
+                                    "source_name": f"{bq_dataset}.{bq_table}",
+                                    "target_name": f"{td_dataset}.{td_table_nm}",
+                                    "target_type": "Table", "tool_name": "GCP",
+                                    "source_environment": "GCP_BQ", "source_servername": "bq_servername",
+                                    "target_environment": "GCP_BQ", "target_servername": "bq_servername",
+                                    "scheduler": "airflow", "system_name": "consumer_wls_ingestion",
+                                    "logger_name": "dof_gcp_process_log", "rerun_indicator": "NA"
+                                }
+                            },
+                            "OkTo": "gcs_archival"
+                        },
+                        {
+                            "Name": "gcs_archival", "Id": "gcs_archival",
+                            "Description": "GCS STS archival",
+                            "Type": "gcs sts archival",
+                            "Params": {
+                                "hook": {
+                                    "gcp_conn_id": gcp_conn_id_alias,
+                                    "source_gcs_bucket": gcs_archival_bucket,
+                                    "source_gcs_path": f"{td_dataset}_{td_table_nm}/data/",
+                                    "archival_bucket": gcs_archival_bucket,
+                                    "archival_path": f"archive/{td_dataset}_{td_table_nm}/data/",
+                                    "OpsgeniePriority": "P2"
+                                },
+                                "obs": {
+                                    "sub_process": "gcs_to_td_load_nos", "keyvalue": "NA",
+                                    "project_name": "consumer_jdbc_ingestion", "source_type": "File",
+                                    "source_name": f"gs://{gcs_bucket}/{td_dataset}_{td_table_nm}/data/*.parquet",
+                                    "target_name": td_table_nm, "target_type": "Table",
+                                    "tool_name": "EDW_TD", "source_environment": "GCP_GCS",
+                                    "source_servername": "gcs_servername", "target_environment": "EDW_TD",
+                                    "target_servername": "teradata_servername", "scheduler": "airflow",
+                                    "system_name": "consumer_wls_bq2td",
+                                    "logger_name": "dof_gcp_process_log", "rerun_indicator": "NA"
+                                }
+                            },
+                            "OkTo": "bq_to_gcs"
+                        },
+                        {
+                            "Name": "bq_to_gcs", "Id": "bq_to_gcs",
+                            "Description": "Export BQ to GCS as CSV",
+                            "Type": "run sql query from file",
+                            "Params": {
+                                "hook": {
+                                    "gcp_conn_id": gcp_conn_id_alias,
+                                    "query": f"CREATE TEMP TABLE {bq_dataset}_{bq_table} AS {query}; EXPORT DATA OPTIONS (uri = 'gs://{gcs_bucket}/{td_dataset}_{td_table_nm}/*.csv', format = 'CSV', overwrite = true, header = false, field_delimiter = '{export_del}') AS SELECT * FROM {bq_dataset}_{bq_table};",
+                                    "projectId": gcp_conn_alias.replace('-', '_'),
+                                    "useLegacySql": "false"
+                                },
+                                "obs": {
+                                    "sub_process": "bqTransformLoad", "keyvalue": "NA",
+                                    "project_name": "EDW_MODERNIZATION", "source_type": "Table",
+                                    "source_name": f"{bq_dataset}.{bq_table}",
+                                    "target_name": f"{td_dataset}.{td_table_nm}",
+                                    "target_type": "Table", "tool_name": "GCP",
+                                    "source_environment": "GCP_BQ", "source_servername": "bq_servername",
+                                    "target_environment": "GCP_BQ", "target_servername": "bq_servername",
+                                    "scheduler": "airflow", "system_name": "consumer_wls_ingestion",
+                                    "logger_name": "dof_gcp_process_log", "rerun_indicator": "NA"
+                                }
+                            },
+                            "OkTo": "deleteTDtgtTable"
+                        },
+                        {
+                            "Name": "deleteTDtgtTable", "Id": "deleteTDtgtTable",
+                            "Description": "Truncate staging table",
+                            "Type": "run jdbc delete query",
+                            "Params": {
+                                "hook": {
+                                    "parameters": {
+                                        "target_dbtype": "teradata", "save_mode": "overwrite",
+                                        "dbinstance": functional_id,
+                                        "query": f"CREATE TABLE WIRELESS_WRITEBACK.{td_dataset}_{td_table_nm}_temp AS WIRELESS_WRITEBACK.{td_dataset}_{td_table_nm} WITH NO DATA; DROP TABLE WIRELESS_WRITEBACK.{td_dataset}_{td_table_nm}; RENAME TABLE WIRELESS_WRITEBACK.{td_dataset}_{td_table_nm}_temp TO WIRELESS_WRITEBACK.{td_dataset}_{td_table_nm};",
+                                        "OpsgeniePriority": "None"
+                                    }
+                                },
+                                "obs": {
+                                    "sub_process": "deleteTDtgtTable", "keyvalue": "NA",
+                                    "project_name": "consumer_jdbc_ingestion",
+                                    "source_type": "Table", "source_name": td_table_nm,
+                                    "target_name": td_table_nm, "target_type": "Table",
+                                    "tool_name": "EDW_TD", "source_environment": "EDW_TD",
+                                    "source_servername": "teradata_servername",
+                                    "target_environment": "EDW_TD", "target_servername": "teradata_servername",
+                                    "scheduler": "airflow", "system_name": "consumer_wls_bq2td",
+                                    "logger_name": "dof_gcp_process_log", "rerun_indicator": "NA"
+                                }
+                            },
+                            "OkTo": "gcs_to_td_load"
+                        },
+                        {
+                            "Name": "gcs_to_td_load", "Id": "gcs_to_td_load",
+                            "Description": "GCS to TD via TPT",
+                            "Type": "load from gcs to td",
+                            "Params": {
+                                "hook": {
+                                    "ssh_conn_id": "ssh_conn_id", "remote_host": "tpt_remote_host",
+                                    "dbinstance": functional_id, "delimiter": tpt_del,
+                                    "min_sessions": min_sess, "max_sessions": max_sess,
+                                    "skiprows": "0", "gcp_conn_id": gcp_conn_id_alias,
+                                    "source_gcs_bucket": gcs_bucket,
+                                    "source_gcs_path": f"{td_dataset}_{td_table_nm}/*.csv",
+                                    "target_dbname": "wireless_writeback",
+                                    "target_table": f"{td_dataset}_{td_table_nm}",
+                                    "final_target_table": f"{td_dataset}_{td_table_nm}",
+                                    "target_log_dbname": "wireless_writeback",
+                                    "archival_bucket": gcs_archival_bucket,
+                                    "audit_table_db": "wireless_writeback",
+                                    "OpsgeniePriority": "None",
+                                    "allow_quoted_newlines": "true", "allow_jagged_rows": "true"
+                                },
+                                "obs": {
+                                    "sub_process": "gcs_to_td_load", "keyvalue": "NA",
+                                    "project_name": "consumer_jdbc_ingestion", "source_type": "File",
+                                    "source_name": f"gs://{gcs_bucket}/{td_dataset}_{td_table_nm}/*.csv",
+                                    "target_name": f"wireless_writeback.{td_dataset}_{td_table_nm}",
+                                    "target_type": "Table", "tool_name": "EDW_TD",
+                                    "source_environment": "GCP_GCS", "source_servername": "gcs_servername",
+                                    "target_environment": "EDW_TD", "target_servername": "teradata_servername",
+                                    "scheduler": "airflow", "system_name": "consumer_wls_bq2td",
+                                    "logger_name": "dof_gcp_process_log", "rerun_indicator": "NA"
+                                }
+                            },
+                            "OkTo": "JDBCTransformLoad"
+                        },
+                        {
+                            "Name": "JDBCTransformLoad", "Id": "JDBCTransformLoad",
+                            "Description": "Staging to Target load",
+                            "Type": "run jdbc query",
+                            "Params": {
+                                "hook": {
+                                    "parameters": {
+                                        "OpsgeniePriority": "P1", "dbinstance": functional_id,
+                                        "target_dbtype": "teradata", "transactional": "true",
+                                        "query": f"BT;\nDELETE FROM {td_dataset}.{td_table_nm} ALL;\nINSERT INTO {td_dataset}.{td_table_nm} ({cols}) SELECT {cols} FROM wireless_writeback.{td_dataset}_{td_table_nm};\nET;"
+                                    }
+                                },
+                                "obs": {
+                                    "sub_process": "JDBCTransformLoad", "keyvalue": "NA",
+                                    "project_name": "consumer_jdbc_ingestion",
+                                    "source_type": "Table", "source_name": f"wireless_writeback.{td_table_nm}",
+                                    "target_name": f"{td_dataset}.{td_table_nm}",
+                                    "target_type": "Table", "tool_name": "EDW_TD",
+                                    "source_environment": "EDW_TD", "source_servername": "teradata_servername",
+                                    "target_environment": "EDW_TD", "target_servername": "teradata_servername",
+                                    "scheduler": "airflow", "rerun_indicator": "NA",
+                                    "system_name": "consumer_wls_bq2td", "logger_name": "dof_gcp_process_log"
+                                }
+                            },
+                            "OkTo": "tls_entry"
+                        },
+                        {
+                            "Name": "tls_entry", "Id": "tls_entry",
+                            "Description": "Table Load Status entry",
+                            "Type": "run jdbc query",
+                            "Params": {
+                                "hook": {
+                                    "parameters": {
+                                        "OpsgeniePriority": "P1", "target_dbtype": "teradata",
+                                        "dbinstance": functional_id,
+                                        "query": f"{td_tsl_query1};"
+                                    }
+                                },
+                                "obs": {
+                                    "sub_process": "tls_entry", "keyvalue": "NA",
+                                    "project_name": "consumer_jdbc_ingestion",
+                                    "source_type": "Table", "source_name": f"{td_dataset}.{td_table_nm}",
+                                    "target_name": "SOURCE_SCHEMA_04.table_load_status",
+                                    "target_type": "Table", "tool_name": "EDW_TD",
+                                    "source_environment": "EDW_TD", "source_servername": "teradata_servername",
+                                    "target_environment": "EDW_TD", "target_servername": "teradata_servername",
+                                    "scheduler": "airflow", "rerun_indicator": "NA",
+                                    "system_name": "consumer_wls_bq2td", "logger_name": "bq_to_JDBC"
+                                }
+                            },
+                            "OkTo": "End"
+                        },
+                        {"Name": "End", "Id": "End", "Description": "Ending point of the dag", "OkTo": "End"}
+                    ]
+                }
+
+            elif load_functionality == "NOS" and load_type in ["FULL LOAD", "FULL_LOAD"]:
+                row = {
+                    **common_header,
+                    "custom_tags": common_tags + ["load_type:nos_full_load"],
+                    "Steps": [
+                        {
+                            "Name": "Start", "Id": "start",
+                            "Description": "Starting point of the dag",
+                            "OkTo": "gcs_archival"
+                        },
+                        {
+                            "Name": "gcs_archival", "Id": "gcs_archival",
+                            "Description": "GCS STS archival",
+                            "Type": "gcs sts archival",
+                            "Params": {
+                                "hook": {
+                                    "gcp_conn_id": gcp_conn_id_alias,
+                                    "source_gcs_bucket": gcs_archival_bucket,
+                                    "source_gcs_path": f"{td_dataset}_{td_table_nm}/data/",
+                                    "archival_bucket": gcs_archival_bucket,
+                                    "archival_path": f"archive/{td_dataset}_{td_table_nm}/data/",
+                                    "OpsgeniePriority": "P2"
+                                },
+                                "obs": {
+                                    "sub_process": "gcs_to_td_load_nos", "keyvalue": "NA",
+                                    "project_name": "consumer_jdbc_ingestion", "source_type": "File",
+                                    "source_name": f"gs://{gcs_bucket}/{td_dataset}_{td_table_nm}/data/*.parquet",
+                                    "target_name": td_table_nm, "target_type": "Table",
+                                    "tool_name": "EDW_TD", "source_environment": "GCP_GCS",
+                                    "source_servername": "gcs_servername", "target_environment": "EDW_TD",
+                                    "target_servername": "teradata_servername", "scheduler": "airflow",
+                                    "system_name": "consumer_wls_bq2td",
+                                    "logger_name": "dof_gcp_process_log", "rerun_indicator": "NA"
+                                }
+                            },
+                            "OkTo": "check_table_load_status"
+                        },
+                        {
+                            "Name": "check_table_load_status", "Id": "check_table_load_status",
+                            "Description": "Validate BQ table freshness",
+                            "Type": "run sql query from file",
+                            "retries": "3", "retryDelay": "minutes=15",
+                            "Params": {
+                                "hook": {
+                                    "gcp_conn_id": gcp_conn_id_alias,
+                                    "query": f"BEGIN IF NOT EXISTS ( {gcp_tls_sql_query1} ) THEN RAISE USING MESSAGE = 'ERROR: Table {bq_table} has not been refreshed in current DAY'; END IF; END;",
+                                    "projectId": gcp_conn_alias.replace('-', '_'),
+                                    "useLegacySql": "false"
+                                },
+                                "obs": {
+                                    "sub_process": "bqTransformLoad", "keyvalue": "NA",
+                                    "project_name": "EDW_MODERNIZATION", "source_type": "Table",
+                                    "source_name": f"{bq_dataset}.{bq_table}",
+                                    "target_name": f"{td_dataset}.{td_table_nm}",
+                                    "target_type": "Table", "tool_name": "GCP",
+                                    "source_environment": "GCP_BQ", "source_servername": "bq_servername",
+                                    "target_environment": "GCP_BQ", "target_servername": "bq_servername",
+                                    "scheduler": "airflow", "system_name": "consumer_wls_ingestion",
+                                    "logger_name": "dof_gcp_process_log", "rerun_indicator": "NA"
+                                }
+                            },
+                            "OkTo": "bq_to_gcs"
+                        },
+                        {
+                            "Name": "bq_to_gcs", "Id": "bq_to_gcs",
+                            "Description": "Export BQ to GCS as Parquet",
+                            "Type": "run sql query from file",
+                            "Params": {
+                                "hook": {
+                                    "gcp_conn_id": gcp_conn_id_alias,
+                                    "query": f"CREATE TEMP TABLE {bq_dataset}_{bq_table} AS {query_nos}; EXPORT DATA OPTIONS (uri = 'gs://{gcs_bucket}/{td_dataset}_{td_table_nm}/data/*.parquet', format = 'PARQUET', overwrite = true) AS SELECT * FROM {bq_dataset}_{bq_table};",
+                                    "projectId": gcp_conn_alias.replace('-', '_'),
+                                    "useLegacySql": "false"
+                                },
+                                "obs": {
+                                    "sub_process": "bqTransformLoad", "keyvalue": "NA",
+                                    "project_name": "EDW_MODERNIZATION", "source_type": "Table",
+                                    "source_name": f"{bq_dataset}.{bq_table}",
+                                    "target_name": f"{td_dataset}.{td_table_nm}",
+                                    "target_type": "Table", "tool_name": "GCP",
+                                    "source_environment": "GCP_BQ", "source_servername": "bq_servername",
+                                    "target_environment": "GCP_BQ", "target_servername": "bq_servername",
+                                    "scheduler": "airflow", "system_name": "consumer_wls_ingestion",
+                                    "logger_name": "dof_gcp_process_log", "rerun_indicator": "NA"
+                                }
+                            },
+                            "OkTo": "foreign_to_stage_load"
+                        },
+                        {
+                            "Name": "foreign_to_stage_load", "Id": "foreign_to_stage_load",
+                            "Description": "Foreign table to staging",
+                            "Type": "run jdbc query",
+                            "Params": {
+                                "hook": {
+                                    "parameters": {
+                                        "OpsgeniePriority": "P1", "target_dbtype": "teradata",
+                                        "dbinstance": functional_id, "transactional": "true",
+                                        "query": f"BT;\nDELETE FROM wireless_writeback.{td_dataset}_{td_table_nm} ALL;\nINSERT INTO wireless_writeback.{td_dataset}_{td_table_nm} ( {custom_format_sel_nos} ) {cols_nos};\nET;"
+                                    }
+                                },
+                                "obs": {
+                                    "sub_process": "foreign_to_stage_load", "keyvalue": "NA",
+                                    "project_name": "consumer_jdbc_ingestion",
+                                    "source_type": "Table",
+                                    "source_name": f"db_wireless_writeback.{td_dataset}_{td_table_nm}",
+                                    "target_name": f"{td_dataset}.{td_table_nm}",
+                                    "target_type": "Table", "tool_name": "EDW_TD",
+                                    "source_environment": "EDW_TD", "source_servername": "teradata_servername",
+                                    "target_environment": "EDW_TD", "target_servername": "teradata_servername",
+                                    "scheduler": "airflow", "rerun_indicator": "NA",
+                                    "system_name": "consumer_wls_bq2td", "logger_name": "bq_to_JDBC"
+                                }
+                            },
+                            "OkTo": "stage_to_target_table_load"
+                        },
+                        {
+                            "Name": "stage_to_target_table_load", "Id": "stage_to_target_table_load",
+                            "Description": "Staging to Target load",
+                            "Type": "run jdbc query",
+                            "Params": {
+                                "hook": {
+                                    "parameters": {
+                                        "OpsgeniePriority": "P1", "dbinstance": functional_id,
+                                        "target_dbtype": "teradata", "transactional": "true",
+                                        "query": f"BT;\nDELETE FROM {td_dataset}.{td_table_nm} ALL;\nINSERT INTO {td_dataset}.{td_table_nm} ( {cols} ) SELECT {cols} FROM WIRELESS_WRITEBACK.{td_dataset}_{td_table_nm};\nDELETE FROM WIRELESS_WRITEBACK.{td_dataset}_{td_table_nm} ALL;\nET;"
+                                    }
+                                },
+                                "obs": {
+                                    "sub_process": "stage_to_target_table_load", "keyvalue": "NA",
+                                    "project_name": "consumer_jdbc_ingestion",
+                                    "source_type": "Table",
+                                    "source_name": f"wireless_writeback.{td_dataset}_{td_table_nm}",
+                                    "target_name": f"{td_dataset}.{td_table_nm}",
+                                    "target_type": "Table", "tool_name": "EDW_TD",
+                                    "source_environment": "EDW_TD", "source_servername": "teradata_servername",
+                                    "target_environment": "EDW_TD", "target_servername": "teradata_servername",
+                                    "scheduler": "airflow", "rerun_indicator": "NA",
+                                    "system_name": "consumer_wls_bq2td", "logger_name": "dof_gcp_process_log"
+                                }
+                            },
+                            "OkTo": "tls_entry"
+                        },
+                        {
+                            "Name": "tls_entry", "Id": "tls_entry",
+                            "Description": "Table Load Status entry",
+                            "Type": "run jdbc query",
+                            "Params": {
+                                "hook": {
+                                    "parameters": {
+                                        "OpsgeniePriority": "P1", "target_dbtype": "teradata",
+                                        "dbinstance": functional_id,
+                                        "query": f"{td_tsl_query1};"
+                                    }
+                                },
+                                "obs": {
+                                    "sub_process": "tls_entry", "keyvalue": "NA",
+                                    "project_name": "consumer_jdbc_ingestion",
+                                    "source_type": "Table", "source_name": f"{td_dataset}.{td_table_nm}",
+                                    "target_name": "SOURCE_SCHEMA_04.table_load_status",
+                                    "target_type": "Table", "tool_name": "EDW_TD",
+                                    "source_environment": "EDW_TD", "source_servername": "teradata_servername",
+                                    "target_environment": "EDW_TD", "target_servername": "teradata_servername",
+                                    "scheduler": "airflow", "rerun_indicator": "NA",
+                                    "system_name": "consumer_wls_bq2td", "logger_name": "bq_to_JDBC"
+                                }
+                            },
+                            "OkTo": "End"
+                        },
+                        {"Name": "End", "Id": "End", "Description": "Ending point of the dag", "OkTo": "End"}
+                    ]
+                }
+            else:
+                print(f"Unsupported load_functionality/load_type combination: {load_functionality}/{load_type} for {tbl}")
+                continue
+
+            f_path = os.path.join(temp_dir, f"pipeline_metadata_{td_ds}_{td_tb}.json")
+            with open(f_path, 'w') as f:
+                json.dump(row, f, indent=4)
+            attachments.append(f_path)
+
+        except Exception as e:
+            print(f"Error processing {tbl}: {e}")
+
+    # --- ZIP AND EMAIL ---
+    if attachments:
+        json_files      = [f for f in attachments if f.endswith('.json')]
+        all_names_html  = "".join(f"<li>{os.path.basename(f)}</li>" for f in attachments)
+        z_path = os.path.join(temp_dir, f"Metadata_Deployment_{datetime.now().strftime('%H%M%S')}.zip")
+        with zipfile.ZipFile(z_path, 'w', zipfile.ZIP_DEFLATED) as z:
+            for f in attachments:
+                z.write(f, os.path.basename(f))
+
+        send_email(
+            to=target_email,
+            subject=f"Writeback Deployment Metadata {project} - {datetime.now().date()}",
+            html_content=f"""
+                <h3>Deployment files generated for project: {project}</h3>
+                <p><b>Total JSON Configs:</b> {len(json_files)}</p>
+                <p><b>Python DAGs deployed to GCS:</b> {len(py_deployed_log)}</p>
+                <p><b>Processed Files:</b></p>
+                <ul>{all_names_html}</ul>
+                <p>Please find all files in the attached zip package.</p>
+            """,
+            files=[z_path]
+        )
+        for f in attachments + [z_path]:
+            if os.path.exists(f):
+                os.remove(f)
+
+
+# --- DAG Definition ---
+
+with DAG(
+    dag_id=DAG_ID,
+    start_date=days_ago(1),
+    schedule_interval=None,
+    catchup=False,
+    params={
+        "Email_Id": "user@example.com",
+        "td_tsl_query": "INSERT INTO SOURCE_SCHEMA_04.table_load_status ( TABLENAME, SOR_ID, LOAD_START_DT, LOAD_START_TM, LOAD_START_TIMESTAMP, LOAD_COMPLETION_DT, LOAD_COMPLETION_TM, LOAD_COMPLETION_TIMESTAMP, INSERT_CNT, UPDATE_CNT, DELETE_CNT, ET_CNT, UV_CNT, LOAD_TYPE, COMMENT_TEXT ) VALUES ( 'var_tb_id', null, CURRENT_DATE, CURRENT_TIME(0), CURRENT_TIMESTAMP(0), CURRENT_DATE, CURRENT_TIME(0), CURRENT_TIMESTAMP(0), 0, 0, 0, 0, 0, 'BTEQ', 'comment_txt' )",
+        "gcp_tls_sql_query": "SELECT 1 FROM `{BQ_PROJECT}.dataset.table_load_status` WHERE lower(table_name) = 'var_tb_id' AND load_completion_date = CURRENT_DATE('America/New_York')",
+        "delimeter": "CNTRLA",
+        "BQ_Table_List": []
+    }
+) as dag:
+
+    generate_task = PythonOperator(
+        task_id="generate_jsons_and_email",
+        python_callable=generate_jsons_and_email,
+        provide_context=True,
+    )

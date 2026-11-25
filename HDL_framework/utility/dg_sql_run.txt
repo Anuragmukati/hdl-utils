@@ -1,0 +1,81 @@
+from __future__ import annotations
+import pendulum
+from airflow.decorators import dag, task
+from airflow.models.dagrun import DagRun
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+
+PROJECT_ID = "PROJECT_ID_99"
+BQ_CONN_ID = "sa-PROJECT_ID_50"
+
+# Define a default set of arguments for the DAG
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "email_on_failure": False,
+    "email_on_retry": False,
+}
+
+@dag(
+    dag_id="dg_sql_run",
+    start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
+    catchup=False,
+    schedule=None,
+    tags=["gcp", "bigquery", "sql", "query"],
+    default_args=default_args,
+    doc_md=__doc__,
+)
+def bq_query_executor():
+    @task
+    def execute_query_and_print_results(dag_run: DagRun) -> dict:
+        """
+        Retrieves the SQL query from DAG run configuration,
+        executes it on BigQuery, and prints the results.
+        """
+        # Get the query from DAG configuration
+        conf = dag_run.conf
+        query = conf.get("query")
+        
+        if not query:
+            raise ValueError("The 'query' configuration parameter is missing or empty.")
+        
+        print("=" * 80)
+        print("SQL Query to be executed:")
+        print("=" * 80)
+        print(query)
+        print("=" * 80)
+        
+        # Initialize BigQuery hook
+        bq_hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID, location="US")
+        
+        try:
+            # Execute the query and fetch results
+            print("Executing query on BigQuery...")
+            
+            # Get BigQuery client and run query
+            client = bq_hook.get_client(project_id=PROJECT_ID)
+            query_job = client.query(query)
+            results = query_job.result()
+            
+            # Convert results to list of dictionaries
+            result_list = []
+            for row in results:
+                result_list.append(dict(row))
+            
+            print(f"Row count: {len(result_list)}")
+
+            return {
+                "status": "success",
+                "row_count": len(result_list),
+            }
+            
+        except Exception as e:
+            print("=" * 80)
+            print(f"Error executing query: {str(e)}")
+            print("=" * 80)
+            raise
+
+    # Execute the task
+    execute_query_and_print_results()
+
+# Instantiate the DAG
+bq_query_executor()

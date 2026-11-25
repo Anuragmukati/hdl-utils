@@ -1,0 +1,503 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.exceptions import AirflowFailException
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from datetime import datetime
+import json
+
+SOURCE_DIR      = "/home/airflow/gcs/dags/PROJECT_ID_25"
+CONFIG_PATH     = f"{SOURCE_DIR}/history_load_config_wave_hdl.json"
+COMPOSER_BUCKET  = "BUCKET_NAME_29"
+def read_config():
+    with open('/home/airflow/gcs/dags/PROJECT_ID_25/history_load_config_wave_hdl.json', 'r') as f:
+        confid_details = json.load(f)
+    return confid_details
+config = read_config()
+hdl_prj=config["hdl_source_project"]
+metadata_db=config['Metadata_Dataset']
+instances_config_tbl=config['instances_config_tbl']
+INSTANCES_TABLE  = f"{hdl_prj}.{metadata_db}.{instances_config_tbl}"
+INSTANCES_CONN_KEY = "GCP_CONN_DO_ID_zdwvdo"
+GCS_DAGS_PREFIX = "dags"
+
+TEMPLATES = {
+    "nos_csv_template.txt": {
+        "filename": "history_load_dag_nos_csv_small_{prj}_{env}{seq_id}.py",
+        "output_folder": "CSV",
+    },
+    "nos_parquet_template.txt": {
+        "filename": "history_load_dag_nos_parquet_{prj}_{env}{seq_id}.py",
+        "output_folder": "Parquet",
+    },
+    "adhoc_csv_template.txt": {
+        "filename": "history_load_dag_nos_csv_adhoc_{prj}_{env}.py",
+        "output_folder": "ADHOC",
+    },
+    "adhoc_parquet_template.txt": {
+        "filename": "history_load_dag_nos_parquet_adhoc_{prj}_{env}.py",
+        "output_folder": "ADHOC",
+    },
+}
+
+PRJ_REQUIRED_KEYS = [
+    "GCP_CONN_DO_ID_{prj}",
+    "GCP_CONN_DO_ID_PLE_{prj}",
+    "bq_prod_project_{prj}",
+    "bq_ple_project_{prj}",
+    "gcs_bucket_name_{prj}",
+    "dag_folder_{prj}",
+]
+
+
+def validate_prj_config(**kwargs):
+    prj = kwargs["dag_run"].conf.get("prj")
+    if not prj:
+        raise AirflowFailException("Missing required param: prj")
+
+    with open(CONFIG_PATH, "r") as f:
+        config = json.load(f)
+
+    missing = [
+        key.format(prj=prj)
+        for key in PRJ_REQUIRED_KEYS
+        if key.format(prj=prj) not in config
+    ]
+
+    if missing:
+        raise AirflowFailException(
+            f"Project '{prj}' is not configured in history_load_config_wave_hdl.json. "
+            f"Add the following missing keys before generating DAGs:\n  " +
+            "\n  ".join(missing)
+        )
+
+    print(f"Config validation passed for prj='{prj}'. All required keys found:")
+    for key in PRJ_REQUIRED_KEYS:
+        full_key = key.format(prj=prj)
+        print(f"  {full_key}: {config[full_key]}")
+
+
+def cleanup_project_dags(**kwargs):
+    params = kwargs["dag_run"].conf
+    prj    = params.get("prj")
+    env    = params.get("env", "").upper()
+
+    if not prj or not env:
+        raise AirflowFailException("Missing required params: prj, env")
+
+    with open(CONFIG_PATH, "r") as f:
+        config = json.load(f)
+
+    dag_folder = config[f"dag_folder_{prj}"]
+    conn_id    = config[f"GCP_CONN_DO_ID_{prj}"]
+    env_marker = f"_{prj}_{env}".lower()
+
+    hook          = GCSHook(gcp_conn_id=conn_id)
+    total_deleted = 0
+
+    for folder in ["CSV", "Parquet", "ADHOC"]:
+        prefix  = f"{GCS_DAGS_PREFIX}/{dag_folder}/{folder}/"
+        objects = hook.list(bucket_name=COMPOSER_BUCKET, prefix=prefix) or []
+        for obj in objects:
+            if env_marker in obj.lower():
+                hook.delete(bucket_name=COMPOSER_BUCKET, object_name=obj)
+                print(f"Deleted: gs://{COMPOSER_BUCKET}/{obj}")
+                total_deleted += 1
+            else:
+                print(f"Skipped (different env): gs://{COMPOSER_BUCKET}/{obj}")
+
+    print(f"Cleanup complete. Deleted {total_deleted} DAG file(s) for prj='{prj}', env='{env}'")
+
+
+def save_child_instances(**kwargs):
+    params        = kwargs["dag_run"].conf
+    prj           = params.get("prj")
+    env           = params.get("env", "").upper()
+    app_name      = params.get("app_name")
+    num_instances = int(params.get("num_instances", 1))
+    run_id        = kwargs["dag_run"].run_id
+
+    if not prj:
+        raise AirflowFailException("Missing required param: prj")
+    if num_instances < 1:
+        raise AirflowFailException("num_instances must be >= 1")
+
+    with open(CONFIG_PATH, "r") as f:
+        config = json.load(f)
+
+    dag_folder = config[f"dag_folder_{prj}"]
+    conn_id    = config[INSTANCES_CONN_KEY]
+
+    merge_sql = f"""
+        MERGE {INSTANCES_TABLE} AS T
+        USING (SELECT '{prj}' AS prj, '{env}' AS env) AS S
+        ON T.prj = S.prj AND T.env = S.env
+        WHEN MATCHED THEN
+            UPDATE SET
+                num_instances   = {num_instances},
+                dag_folder      = '{dag_folder}',
+                app_name        = '{app_name}',
+                last_updated_at = CURRENT_TIMESTAMP(),
+                last_updated_by = '{run_id}'
+        WHEN NOT MATCHED THEN
+            INSERT (prj, num_instances, dag_folder, env, app_name, last_updated_at, last_updated_by)
+            VALUES ('{prj}', {num_instances}, '{dag_folder}', '{env}', '{app_name}', CURRENT_TIMESTAMP(), '{run_id}')
+    """
+
+    hook   = BigQueryHook(gcp_conn_id=conn_id, use_legacy_sql=False)
+    conn   = hook.get_conn()
+    cursor = conn.cursor()
+    cursor.execute(merge_sql)
+
+    print(f"Upserted prj='{prj}', env='{env}', app_name='{app_name}', num_instances={num_instances}, dag_folder='{dag_folder}' into {INSTANCES_TABLE}")
+
+def generate_dag(template_file, **kwargs):
+    params        = kwargs["dag_run"].conf
+    prj           = params.get("prj")
+    env           = params.get("env", "").upper()
+    app_name      = params.get("app_name")
+    num_instances = int(params.get("num_instances", 1))
+
+    if not all([prj, env, app_name]):
+        raise AirflowFailException("Missing required params: prj, env, app_name")
+
+    with open(CONFIG_PATH, "r") as f:
+        config = json.load(f)
+
+    dag_folder = config[f"dag_folder_{prj}"]
+    cfg        = TEMPLATES[template_file]
+    conn_id    = config[f"GCP_CONN_DO_ID_{prj}"]
+
+    template_path = f"{SOURCE_DIR}/Template/{template_file}"
+    with open(template_path, "r") as f:
+        template_content = f.read()
+
+    hook = GCSHook(gcp_conn_id=conn_id)
+
+    for seq_id in range(1, num_instances + 1):
+        seq_str = str(seq_id)
+        content = template_content.replace("@prj",      prj)
+        content = content.replace("@env",      env)
+        content = content.replace("@app_name", app_name)
+        content = content.replace("@seq_id",   seq_str)
+
+        dag_filename = cfg["filename"].format(prj=prj, env=env, seq_id=seq_str)
+        gcs_object   = f"{GCS_DAGS_PREFIX}/{dag_folder}/{cfg['output_folder']}/{dag_filename}"
+
+        hook.upload(
+            bucket_name=COMPOSER_BUCKET,
+            object_name=gcs_object,
+            data=content.encode("utf-8"),
+            mime_type="text/x-python",
+        )
+
+        print(f"Uploaded [{seq_id}/{num_instances}]: gs://{COMPOSER_BUCKET}/{gcs_object}")
+
+
+def create_stored_procedure(sp_name, **kwargs):
+    params = kwargs["dag_run"].conf
+    prj    = params.get("prj")
+    env    = params.get("env", "").upper()
+
+    if not prj:
+        raise AirflowFailException("Missing required param: prj")
+
+    with open(CONFIG_PATH, "r") as f:
+        config = json.load(f)
+
+    conn_id    = config[f"GCP_CONN_DO_ID_{prj}"]
+    bq_project = config[f"bq_ple_project_{prj}"] if env == "PLE" else config[f"bq_prod_project_{prj}"]
+
+    sp_path = f"{SOURCE_DIR}/DDL/{sp_name}.sql"
+    with open(sp_path, "r") as f:
+        sql = f.read()
+
+    sql = sql.replace("@project", bq_project)
+
+    hook   = BigQueryHook(gcp_conn_id=conn_id, use_legacy_sql=False)
+    conn   = hook.get_conn()
+    cursor = conn.cursor()
+    cursor.execute(sql)
+
+    print(f"Created SP {sp_name} in project {bq_project} using conn_id={conn_id}")
+
+
+def generate_adhoc_dag(template_file, **kwargs):
+    params   = kwargs["dag_run"].conf
+    prj      = params.get("prj")
+    env      = params.get("env", "").upper()
+    app_name = params.get("app_name")
+
+    if not all([prj, env, app_name]):
+        raise AirflowFailException("Missing required params: prj, env, app_name")
+
+    with open(CONFIG_PATH, "r") as f:
+        config = json.load(f)
+
+    dag_folder = config[f"dag_folder_{prj}"]
+    cfg        = TEMPLATES[template_file]
+    conn_id    = config[f"GCP_CONN_DO_ID_{prj}"]
+
+    template_path = f"{SOURCE_DIR}/Template/{template_file}"
+    with open(template_path, "r") as f:
+        content = f.read()
+
+    content = content.replace("@prj",      prj)
+    content = content.replace("@env",      env)
+    content = content.replace("@app_name", app_name)
+
+    dag_filename = cfg["filename"].format(prj=prj, env=env)
+    gcs_object   = f"{GCS_DAGS_PREFIX}/{dag_folder}/{cfg['output_folder']}/{dag_filename}"
+
+    hook = GCSHook(gcp_conn_id=conn_id)
+    hook.upload(
+        bucket_name=COMPOSER_BUCKET,
+        object_name=gcs_object,
+        data=content.encode("utf-8"),
+        mime_type="text/x-python",
+    )
+
+    print(f"Uploaded: gs://{COMPOSER_BUCKET}/{gcs_object} using conn_id={conn_id}")
+
+
+# ---------------------------------------------------------------------------
+# Refresh-ALL: re-generates DAGs for every project in instances_config_tbl
+# ---------------------------------------------------------------------------
+
+def refresh_all_projects(**_):
+    with open(CONFIG_PATH, "r") as f:
+        config = json.load(f)
+
+    bq_hook = BigQueryHook(gcp_conn_id=config[INSTANCES_CONN_KEY], use_legacy_sql=False)
+    cursor  = bq_hook.get_conn().cursor()
+    cursor.execute(
+        f"SELECT prj, env, app_name, num_instances FROM {INSTANCES_TABLE} ORDER BY prj"
+    )
+    rows = cursor.fetchall()
+
+    if not rows:
+        raise AirflowFailException(f"No projects found in {INSTANCES_TABLE}")
+
+    print(f"Found {len(rows)} project(s) to refresh: {[(r[0], r[1]) for r in rows]}")
+
+    succeeded = []
+    errors    = []
+    sp_errors = []
+
+    for row in rows:
+        prj, env, app_name, num_instances = row[0], row[1].upper(), row[2], int(row[3] or 1)
+        print(f"\n{'='*60}")
+        print(f"[START] prj='{prj}' | env='{env}' | app_name='{app_name}' | num_instances={num_instances}")
+        print(f"{'='*60}")
+        try:
+            missing = [k.format(prj=prj) for k in PRJ_REQUIRED_KEYS if k.format(prj=prj) not in config]
+            if missing:
+                raise Exception(f"Missing config keys: {missing}")
+
+            dag_folder = config[f"dag_folder_{prj}"]
+            conn_id    = config[f"GCP_CONN_DO_ID_{prj}"]
+            gcs_hook   = GCSHook(gcp_conn_id=conn_id)
+
+            env_marker = f"_{prj}_{env}".lower()
+            for folder in ["CSV", "Parquet", "ADHOC"]:
+                prefix  = f"{GCS_DAGS_PREFIX}/{dag_folder}/{folder}/"
+                objects = gcs_hook.list(bucket_name=COMPOSER_BUCKET, prefix=prefix) or []
+                for obj in objects:
+                    if env_marker in obj.lower():
+                        gcs_hook.delete(bucket_name=COMPOSER_BUCKET, object_name=obj)
+                        print(f"  [CLEANUP] Deleted: gs://{COMPOSER_BUCKET}/{obj}")
+
+            for template_file, cfg in TEMPLATES.items():
+                is_adhoc = "adhoc" in template_file
+                iters    = 1 if is_adhoc else num_instances
+
+                with open(f"{SOURCE_DIR}/Template/{template_file}", "r") as f:
+                    tmpl = f.read()
+
+                for seq_id in range(1, iters + 1):
+                    seq_str = str(seq_id)
+                    content = tmpl.replace("@prj",      prj) \
+                                  .replace("@env",      env) \
+                                  .replace("@app_name", app_name) \
+                                  .replace("@seq_id",   seq_str)
+
+                    dag_filename = (
+                        cfg["filename"].format(prj=prj, env=env)
+                        if is_adhoc
+                        else cfg["filename"].format(prj=prj, env=env, seq_id=seq_str)
+                    )
+                    gcs_object = f"{GCS_DAGS_PREFIX}/{dag_folder}/{cfg['output_folder']}/{dag_filename}"
+                    gcs_hook.upload(
+                        bucket_name=COMPOSER_BUCKET,
+                        object_name=gcs_object,
+                        data=content.encode("utf-8"),
+                        mime_type="text/x-python",
+                    )
+                    print(f"  [UPLOAD] gs://{COMPOSER_BUCKET}/{gcs_object}")
+
+            bq_project = (
+                config[f"bq_ple_project_{prj}"]
+                if env == "PLE"
+                else config[f"bq_prod_project_{prj}"]
+            )
+            bq_cursor = BigQueryHook(gcp_conn_id=conn_id, use_legacy_sql=False).get_conn().cursor()
+            for sp_name in ["SP_TGT_LOAD", "SP_TGT_LOAD_APPEND"]:
+                try:
+                    with open(f"{SOURCE_DIR}/DDL/{sp_name}.sql", "r") as f:
+                        sql = f.read().replace("@project", bq_project)
+                    bq_cursor.execute(sql)
+                    print(f"  [SP] Created {sp_name} in {bq_project}")
+                except Exception as sp_err:
+                    sp_errors.append(f"{prj} ({env}) — {sp_name}: {sp_err}")
+                    print(f"  [SP_FAILED] prj='{prj}' env='{env}' sp='{sp_name}' | ERROR: {sp_err}")
+
+            succeeded.append(f"{prj} ({env})")
+            print(f"[SUCCESS] prj='{prj}' env='{env}' refreshed successfully.")
+
+        except Exception as e:
+            errors.append(f"{prj} ({env})")
+            print(f"[FAILED]  prj='{prj}' env='{env}' | ERROR: {e}")
+
+    print(f"\n{'='*60}")
+    print(f"REFRESH COMPLETE — {len(rows)} project(s) processed")
+    print(f"  SUCCESS     ({len(succeeded)}): {', '.join(succeeded) if succeeded else 'none'}")
+    print(f"  FAILED      ({len(errors)}):  {', '.join(errors)     if errors    else 'none'}")
+    print(f"  SP_FAILED   ({len(sp_errors)}): {', '.join(sp_errors) if sp_errors  else 'none'}")
+    print(f"{'='*60}")
+
+    if errors or sp_errors:
+        raise AirflowFailException(
+            f"{len(errors)} project(s) failed, {len(sp_errors)} SP(s) failed. "
+            f"Search logs for '[FAILED]' and '[SP_FAILED]' to see individual errors."
+        )
+
+
+def branch_on_refresh_all(**kwargs):
+    if kwargs["dag_run"].conf.get("refresh_all", False):
+        return "refresh_all_projects"
+    return "validate_prj_config"
+
+
+# ---------------------------------------------------------------------------
+# Single DAG with two modes:
+#   refresh_all=False (default) → single-project pipeline
+#   refresh_all=True            → refresh all projects from instances_config_tbl
+# ---------------------------------------------------------------------------
+
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "start_date": datetime(2025, 4, 9),
+    "retries": 0,
+}
+
+dag = DAG(
+    dag_id="Historical_New_Project_Dag_Setup",
+    default_args=default_args,
+    description="Single-project setup OR full refresh of all projects from instances_config_tbl",
+    schedule_interval=None,
+    catchup=False,
+    params={
+        "prj": "zdwvdo",
+        "env": "pp",
+        "app_name": "my_app",
+        "num_instances": 1,
+        "refresh_all": False,
+    },
+)
+
+branch_task = BranchPythonOperator(
+    task_id="branch_refresh_or_single",
+    python_callable=branch_on_refresh_all,
+    provide_context=True,
+    dag=dag,
+)
+
+refresh_all_task = PythonOperator(
+    task_id="refresh_all_projects",
+    python_callable=refresh_all_projects,
+    provide_context=True,
+    dag=dag,
+)
+
+validate_config = PythonOperator(
+    task_id="validate_prj_config",
+    python_callable=validate_prj_config,
+    provide_context=True,
+    dag=dag,
+)
+
+cleanup_dags = PythonOperator(
+    task_id="cleanup_project_dags",
+    python_callable=cleanup_project_dags,
+    provide_context=True,
+    dag=dag,
+)
+
+save_instances = PythonOperator(
+    task_id="save_child_instances",
+    python_callable=save_child_instances,
+    provide_context=True,
+    dag=dag,
+)
+
+generate_csv = PythonOperator(
+    task_id="generate_nos_csv_dag",
+    python_callable=generate_dag,
+    op_kwargs={"template_file": "nos_csv_template.txt"},
+    provide_context=True,
+    dag=dag,
+)
+
+generate_parquet = PythonOperator(
+    task_id="generate_nos_parquet_dag",
+    python_callable=generate_dag,
+    op_kwargs={"template_file": "nos_parquet_template.txt"},
+    provide_context=True,
+    dag=dag,
+)
+
+generate_adhoc_csv = PythonOperator(
+    task_id="generate_adhoc_csv_dag",
+    python_callable=generate_adhoc_dag,
+    op_kwargs={"template_file": "adhoc_csv_template.txt"},
+    provide_context=True,
+    dag=dag,
+)
+
+generate_adhoc_parquet = PythonOperator(
+    task_id="generate_adhoc_parquet_dag",
+    python_callable=generate_adhoc_dag,
+    op_kwargs={"template_file": "adhoc_parquet_template.txt"},
+    provide_context=True,
+    dag=dag,
+)
+
+create_sp_tgt_load = PythonOperator(
+    task_id="create_sp_tgt_load",
+    python_callable=create_stored_procedure,
+    op_kwargs={"sp_name": "SP_TGT_LOAD"},
+    provide_context=True,
+    dag=dag,
+)
+
+create_sp_tgt_load_append = PythonOperator(
+    task_id="create_sp_tgt_load_append",
+    python_callable=create_stored_procedure,
+    op_kwargs={"sp_name": "SP_TGT_LOAD_APPEND"},
+    provide_context=True,
+    dag=dag,
+)
+
+# Branch 1: refresh all projects
+branch_task >> refresh_all_task
+
+# Branch 2: single-project pipeline
+branch_task >> validate_config >> cleanup_dags >> save_instances >> [
+    generate_csv,
+    generate_parquet,
+    generate_adhoc_csv,
+    generate_adhoc_parquet,
+    create_sp_tgt_load,
+    create_sp_tgt_load_append,
+]

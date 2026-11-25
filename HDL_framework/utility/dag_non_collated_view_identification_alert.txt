@@ -1,0 +1,114 @@
+import os
+import pandas as pd
+from airflow import DAG
+from airflow.utils.dates import days_ago
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.operators.python import PythonOperator
+from airflow.operators.email import EmailOperator
+from airflow.operators.empty import EmptyOperator
+
+DAG_ID = "dag_non_collated_view_identification_alert"
+
+default_args = {
+    'owner': 'airflow',
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'retries': 0
+}
+
+def fetch_and_prepare_reports(**context):
+    hook = BigQueryHook(gcp_conn_id="sa-PROJECT_ID_28", use_legacy_sql=False)
+    hook1 = BigQueryHook(gcp_conn_id="sa-PROJECT_ID_26", use_legacy_sql=False)
+    query = """
+     select
+DISTINCT
+C.Table_Catalog||'.'||C.TABLE_SCHEMA||'.'||C.TABLE_NAME as Full_Table_Name,
+from PROJECT_ID_30.region-us.INFORMATION_SCHEMA.COLUMNS C
+INNER JOIN  PROJECT_ID_30.region-us.INFORMATION_SCHEMA.TABLES T
+ON C.TABLE_SCHEMA=T.TABLE_SCHEMA
+AND C.TABLE_NAME=T.TABLE_NAME
+AND collation_name <>'und:ci'
+AND data_type LIKE 'STRING%'
+AND table_type='VIEW'
+AND COLUMN_NAME NOT IN ('cust_id','cust_line_seq_id ','mtn','acct_num')
+and C.TABLE_SCHEMA not like '%nogsam_v%'
+and C.TABLE_SCHEMA not like '%nogsampriv_v%'
+and C.TABLE_SCHEMA not like '%prot_v%'
+and C.TABLE_SCHEMA not like '%rd_v%'
+and C.TABLE_SCHEMA not like '%_v%'
+    """
+    query1 = """
+     select
+DISTINCT
+C.Table_Catalog||'.'||C.TABLE_SCHEMA||'.'||C.TABLE_NAME as Full_Table_Name,
+from PROJECT_ID_29.region-us.INFORMATION_SCHEMA.COLUMNS C
+INNER JOIN  PROJECT_ID_29.region-us.INFORMATION_SCHEMA.TABLES T
+ON C.TABLE_SCHEMA=T.TABLE_SCHEMA
+AND C.TABLE_NAME=T.TABLE_NAME
+AND collation_name <>'und:ci'
+AND data_type LIKE 'STRING%'
+AND table_type='VIEW'
+AND COLUMN_NAME NOT IN ('cust_id','cust_line_seq_id ','mtn','acct_num')
+and C.TABLE_SCHEMA not like '%nogsam_v%'
+and C.TABLE_SCHEMA not like '%nogsampriv_v%'
+and C.TABLE_SCHEMA not like '%prot_v%'
+and C.TABLE_SCHEMA not like '%rd_v%'
+and C.TABLE_SCHEMA not like '%_v%'
+    """
+    
+    df = hook.get_pandas_df(sql=query, dialect="standard", location="US")
+    df1 = hook1.get_pandas_df(sql=query1, dialect="standard", location="US")
+
+    
+    stmt=''
+    if df.empty:
+        print("Non-Collated view not found in Gk1v-EDWDO Project")
+        stmt='Non-Collated view not found in Gk1v-EDWDO Project.'
+    if df1.empty:
+        print("Non-Collated view not found in Gk1v-EDWpr Project")
+        stmt=str(stmt)+' Non-Collated view not found in Gk1v-EDWPR Project.'
+
+    file_path = f"/tmp/file_delay_report_{context['ds']}.csv"
+    df.to_csv(file_path, index=False)
+    df1.to_csv(file_path, mode='a', index=False, header=False)
+    email_op = EmailOperator(
+        task_id=f"send_emails",
+        to=["user@example.com"],
+        cc=["user@example.com","user@example.com","user@example.com","user@example.com","user@example.com"],
+        subject=f"Non Collated Views Report - {context['ds']}",
+        html_content=f"""
+            <p>Hello,</p> 
+            <p>Please find the attached CSV report for <b>Non Collated Views at {context['ds']} </b>.</p>
+            <p>Summary:{stmt}</p>
+            <p>You Can open this file directly in Excel or Upload it to Google Sheets.</p>
+        """,
+        files=[file_path], # This attaches the file
+    )
+    email_op.execute(context=context)
+      
+      # Optional: Clean up the file after sending
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+
+with DAG(
+    DAG_ID,
+    default_args=default_args,
+    schedule_interval='0 2 * * *',
+    start_date=days_ago(1),
+    catchup=False,
+    tags=['composer', 'reporting'],
+) as dag:
+
+    start = EmptyOperator(task_id="start")
+
+    fetch_task = PythonOperator(
+        task_id='fetch_and_prepare_reports',
+        python_callable=fetch_and_prepare_reports,
+    )
+
+
+
+    end = EmptyOperator(task_id="end")
+
+    start >> fetch_task >> end

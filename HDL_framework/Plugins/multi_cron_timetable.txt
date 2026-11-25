@@ -1,0 +1,73 @@
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+from airflow.plugins_manager import AirflowPlugin
+from airflow.timetables.base import DagRunInfo, DataInterval, TimeRestriction, Timetable
+from airflow.timetables.trigger import CronTriggerTimetable
+
+logger = logging.getLogger("airflow.timetable.multicron")
+
+class MultiCronTriggerTimetable(Timetable):
+    """
+    A high-performance timetable for Airflow 2.x combining multiple cron expressions.
+    Designed to safely serialize and run smoothly across HA dual-schedulers in Cloud Composer.
+    """
+    def __init__(self, crons: List[str], timezone: str = "UTC"):
+        if not crons:
+            raise ValueError("MultiCronTriggerTimetable requires at least one cron expression.")
+        
+        self._crons = sorted(list(set(crons))) # Deduplicate and stabilize order
+        self._timezone_str = timezone
+        
+        # Instantiate and cache underlying native timetables to eliminate parsing loop overhead
+        self._timetables = [CronTriggerTimetable(cron, timezone=timezone) for cron in self._crons]
+
+    @classmethod
+    def deserialize(cls, data: Dict[str, Any]) -> "Timetable":
+        """Deserializes metadata from the Cloud SQL database back into Schedulers and Web Server."""
+        return cls(crons=data["crons"], timezone=data["timezone"])
+
+    def serialize(self) -> Dict[str, Any]:
+        """Serializes instances into database-friendly formats for schema-safety across 2000+ DAGs."""
+        return {
+            "crons": self._crons,
+            "timezone": self._timezone_str,
+        }
+
+    @property
+    def summary(self) -> str:
+        """Determines the UI representation visible in the Airflow Webserver Grid View."""
+        return f"Multi-Cron Trigger: {', '.join(self._crons)} ({self._timezone_str})"
+
+    def infer_manual_data_interval(self, *, run_after: datetime) -> DataInterval:
+        """Determines the data interval logic for manual execution overrides ('Trigger DAG')."""
+        return DataInterval.exact(run_after)
+
+    def next_dagrun_info(
+        self, *, last_automated_data_interval: Optional[DataInterval], restriction: TimeRestriction
+    ) -> Optional[DagRunInfo]:
+        """Calculates the upcoming execution target by scanning across all combined schedules."""
+        next_runs = []
+        
+        for timetable in self._timetables:
+            try:
+                info = timetable.next_dagrun_info(
+                    last_automated_data_interval=last_automated_data_interval,
+                    restriction=restriction
+                )
+                if info and info.run_after:
+                    next_runs.append(info.run_after)
+            except Exception as e:
+                # Defensive capture: isolates any single corrupted cron definition from breaking the core scheduler 
+                logger.error(f"Error calculating next run timeline for expression '{timetable._expression}': {str(e)}")
+                
+        if not next_runs:
+            return None
+            
+        # Lock schedule to the absolute earliest chronologically available trigger target
+        return DagRunInfo.exact(min(next_runs))
+
+
+class MultiCronTimetablePlugin(AirflowPlugin):
+    name = "multi_cron_timetable_plugin"
+    timetables = [MultiCronTriggerTimetable]

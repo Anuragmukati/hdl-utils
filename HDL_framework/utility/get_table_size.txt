@@ -1,0 +1,2 @@
+sh proddo.sh
+sh bq_query.sh "select * from PROJECT_ID_31.edw_data_migration_ops_tbls.dbc_tablesizev where lower(concat(trim(databasename),'.',trim(tablename))) in ($1)" $2

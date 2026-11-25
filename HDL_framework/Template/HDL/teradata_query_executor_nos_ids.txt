@@ -1,0 +1,109 @@
+from airflow import DAG
+from airflow.hooks.base import BaseHook
+from airflow.operators.python import PythonOperator
+from airflow.utils.dates import days_ago
+import teradatasql
+
+
+def run_teradata_query(**context):
+    query = context["dag_run"].conf.get("query")
+    conn_id = context["dag_run"].conf.get("conn_id", "FUNCTION_ID_1")
+    if not query:
+        raise ValueError("No query provided in DAG run config")
+
+    queries = [q.strip() for q in query.split(";") if q.strip()]
+    if not queries:
+        raise ValueError("No valid queries found after splitting on semicolon")
+
+    conn = BaseHook.get_connection(conn_id)
+    host = conn.host
+    username = conn.login
+    password = conn.password
+
+    results = []
+
+    print(f"Executing {len(queries)} query(ies) on Teradata host: {host}")
+    with teradatasql.connect(
+        host=host,
+        user=username,
+        password=password
+    ) as td_conn:
+        for i, q in enumerate(queries, start=1):
+            status = {"index": i, "query": q, "status": None, "output": None, "error": None}
+            first_word = q.split()[0].upper() if q.split() else ""
+            print(f"\n--- Query {i}/{len(queries)} ---")
+            print(q)
+            try:
+                with td_conn.cursor() as cur:
+                    cur.execute(q)
+                    if first_word == "SELECT":
+                        rows = cur.fetchall()
+                        col_names = [desc[0] for desc in cur.description] if cur.description else []
+                        status["status"] = "SUCCESS"
+                        status["output"] = {"columns": col_names, "rows": rows, "row_count": len(rows)}
+                        print(f"  => SELECT returned {len(rows)} rows")
+                        print(f"  Columns: {col_names}")
+                        for row in rows[:5]:
+                            print(f"  {row}")
+                        if len(rows) > 5:
+                            print(f"  ... ({len(rows) - 5} more rows)")
+                    else:
+                        status["status"] = "SUCCESS"
+                        status["output"] = "completed"
+                        print(f"  => {first_word} completed successfully")
+            except Exception as e:
+                status["status"] = "FAILED"
+                status["error"] = str(e)
+                print(f"  => FAILED: {e}")
+            results.append(status)
+
+    print("\n========== EXECUTION SUMMARY ==========")
+    for r in results:
+        tag = f"[Query {r['index']}]"
+        if r["status"] == "SUCCESS":
+            first_word = r["query"].split()[0].upper() if r["query"].split() else ""
+            if first_word == "SELECT":
+                row_count = r["output"]["row_count"]
+                print(f"{tag} SUCCESS - SELECT returned {row_count} row(s)")
+                print(f"  Columns: {r['output']['columns']}")
+                for row in r["output"]["rows"][:5]:
+                    print(f"  {row}")
+                if row_count > 5:
+                    print(f"  ... ({row_count - 5} more rows)")
+            else:
+                print(f"{tag} SUCCESS - {first_word} completed")
+        else:
+            print(f"{tag} FAILED  - {r['error']}")
+        print(f"  Query: {r['query'][:120]}{'...' if len(r['query']) > 120 else ''}")
+    print("=======================================")
+
+    failed = [r for r in results if r["status"] == "FAILED"]
+    if failed:
+        raise Exception(
+            f"{len(failed)} of {len(results)} query(ies) failed. "
+            f"Failed indices: {[r['index'] for r in failed]}"
+        )
+
+default_args = {
+    "owner": "onix",
+    "depends_on_past": False,
+    "retries": 0,
+}
+
+with DAG(
+    dag_id="teradata_query_executor_nos_ids",
+    default_args=default_args,
+    start_date=days_ago(1),
+    schedule_interval=None,
+    catchup=False,
+    tags=["teradata", "gcp-secret"],
+) as dag:
+
+    execute_td_query = PythonOperator(
+        task_id="execute_td_query",
+        python_callable=run_teradata_query,
+        provide_context=True,
+    )
+
+
+execute_td_query

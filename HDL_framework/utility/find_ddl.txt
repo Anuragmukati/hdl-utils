@@ -1,0 +1,105 @@
+import os
+import csv
+import shutil
+
+# ── Hardcoded paths ───────────────────────────────────────────
+INPUT_FILE      = r"C:/path/to/local/file"
+BQ_DDL_PATH     = r"C:/path/to/local/file"
+TABLES_FOLDER   = r"C:/path/to/local/file"
+VIEWS_FOLDER    = r"C:/path/to/local/file"
+MANIFEST_CSV    = r"C:/path/to/local/file"
+# ─────────────────────────────────────────────────────────────
+
+
+def find_ddl_file(base_path, db_nm, tbl_nm):
+    candidates = [
+        (os.path.join(base_path, db_nm, "Tables", f"{db_nm}_{tbl_nm}.sql"), "TABLE"),
+        (os.path.join(base_path, db_nm, "Views",  f"{db_nm}_{tbl_nm}.sql"), "VIEW"),
+        (os.path.join(base_path, db_nm, "Tables", f"{tbl_nm}.sql"),         "TABLE"),
+        (os.path.join(base_path, db_nm, "Views",  f"{tbl_nm}.sql"),         "VIEW"),
+        (os.path.join(base_path, db_nm, f"{db_nm}.{tbl_nm}.sql"),           "TABLE"),
+        (os.path.join(base_path, db_nm, f"{db_nm}_{tbl_nm}.sql"),           "TABLE"),
+    ]
+    for path, obj_type in candidates:
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read(500).upper()
+                obj_type = "VIEW" if ("CREATE OR REPLACE VIEW" in content or "CREATE VIEW" in content) else "TABLE"
+            except Exception:
+                pass
+            return path, obj_type
+    return None, None
+
+
+def main():
+    # Validate paths
+    for label, path in [("INPUT_FILE", INPUT_FILE), ("BQ_DDL_PATH", BQ_DDL_PATH)]:
+        if not os.path.exists(path):
+            print(f"ERROR: {label} not found: {path}")
+            return
+
+    os.makedirs(TABLES_FOLDER, exist_ok=True)
+    os.makedirs(VIEWS_FOLDER,  exist_ok=True)
+
+    # Clear existing SQL files before copying new ones
+    for folder, label in [(TABLES_FOLDER, "Tables"), (VIEWS_FOLDER, "Views")]:
+        removed = 0
+        for fname in os.listdir(folder):
+            if fname.lower().endswith(".sql"):
+                os.remove(os.path.join(folder, fname))
+                removed += 1
+        if removed:
+            print(f"  Cleared {removed} existing file(s) from {label} folder")
+
+    # Read table list
+    objects = []
+    with open(INPUT_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "." not in line:
+                print(f"WARNING: Skipping invalid entry (expected db_nm.tbl_nm): {line}")
+                continue
+            objects.append(line)
+
+    found, not_found = [], []
+
+    with open(MANIFEST_CSV, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["object", "db_nm", "tbl_nm", "object_type", "status", "source_ddl_path", "copied_to"])
+
+        for obj in objects:
+            db_nm, tbl_nm = obj.split(".", 1)
+            ddl_path, obj_type = find_ddl_file(BQ_DDL_PATH, db_nm, tbl_nm)
+
+            if ddl_path:
+                dest_folder = VIEWS_FOLDER if obj_type == "VIEW" else TABLES_FOLDER
+                dest = os.path.join(dest_folder, os.path.basename(ddl_path))
+                shutil.copy2(ddl_path, dest)
+                writer.writerow([obj, db_nm, tbl_nm, obj_type, "FOUND", ddl_path, dest])
+                found.append(obj)
+                print(f"  COPIED  [{obj_type:5}]  {obj}  ->  {dest}")
+            else:
+                writer.writerow([obj, db_nm, tbl_nm, "UNKNOWN", "NOT_FOUND", "", ""])
+                not_found.append(obj)
+                print(f"  MISSING         {obj}")
+
+    print(f"\n{'='*65}")
+    print(f"Total  : {len(objects)}")
+    print(f"Copied : {len(found)}")
+    print(f"Missing: {len(not_found)}")
+    print(f"{'='*65}")
+    print(f"Tables copied to: {TABLES_FOLDER}")
+    print(f"Views  copied to: {VIEWS_FOLDER}")
+    print(f"Manifest written: {MANIFEST_CSV}")
+
+    if not_found:
+        print("\nNot found:")
+        for obj in not_found:
+            print(f"  - {obj}")
+
+
+if __name__ == "__main__":
+    main()

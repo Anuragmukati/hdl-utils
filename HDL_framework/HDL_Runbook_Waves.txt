@@ -1,0 +1,389 @@
+﻿Runbook: HDL Framework
+1. Overview
+
+This framework orchestrates and automates the loading of Teradata tables into BigQuery using Airflow in two environments:
+
+- PLE (Pre-Live Environment) – handles control, orchestration, and audit.
+- PROD – executes actual data extraction and loads.
+
+It supports both full loads via Teradata NOS and delta catch-up loads via TPT, and includes complete auditability, pod-based DAG routing, and GCS-based file exchange.
+2. DAG Orchestration and Queue Routing
+
+
+Each of the pod DAGs history_load_dag_pod is responsible for accepting the config JSON input and routing it to the appropriate queue table based on table characteristics. 
+
+The Metadata Table:
+  - PROJECT_ID_01.edw_data_migration_ops_tbls.historical_load_metadata_table
+The Audit Table:
+  - PROJECT_ID_01.edw_data_migration_audit_tbls.historical_load_audit_table
+The Child Instance Config Table: 
+   - PROJECT_ID_01.edw_data_migration_ops_tbls.hdl_project_instances_config
+
+The available queue tables are:
+
+  - PROJECT_ID_01.edw_data_migration_ops_tbls.Nos_queue_table_small : This is NOS CSV 
+  - PROJECT_ID_01.edw_data_migration_ops_tbls.Nos_queue_table_small_p: This is for NOS Parquet
+  - PROJECT_ID_01.edw_data_migration_ops_tbls.TPT_queue_table_FullLoad: This is for TPT 
+
+The pod DAG does not perform the data load itself. Instead, it prepares the load by classifying and inserting entries into one of the above queue tables. It then waits for the corresponding PROD DAGs to perform the load.
+
+There are 2-3 dedicated DAGs per project space in the PROD Composer environment that run every 1 minutes:
+ - history_load_dag_nos_parquet_small > 25 GB
+ - history_load_dag_tpt_Fullload < 25 GB
+
+Each of these DAGs checks the corresponding queue table. If an entry is found, it triggers the appropriate load mechanism (NOS or TPT). Loads are performed in the following sequence:
+1. Load to PROD GCS bucket
+2. From GCS bucket to BQ prod tables
+
+If no entry is found in the queue, the DAG simply skips execution.
+
+The original pod DAG (e.g., history_load_dag_pod) waits until all its assigned tables are processed. It enforces a hard timeout of 300 minutes. If processing does not complete in this window, the pod DAG terminates and logs a summary of the status (success, partial, or failure) in the Airflow logs.
+3. Creation of Metadata Entry for Table.
+
+
+Metadata is a prerequisite for loading tables. We have developed two DAGs to automate the creation and optional update of this metadata.1. 
+a. hdl_metadata_creation_dag_for_all_UGs
+This DAG handles both metadata creation and BQ target mapping in a single run. It has two sequential tasks:
+Task 1 — create_metadata_task: Creates the initial metadata entry for each table.
+Task 2 — update_bq_targets_task: Updates the BQ target schema/table name if the Teradata table name and BigQuery table name differ (e.g. for Fpass, Commercial Hub). If both names are identical it skips automatically.
+It requires the following parameters:
+* App_Name (required)
+   * The application name corresponding to the defined GCP project.
+   * Valid suffixes: _PLE_Full, _PP_Full, _PP_Full_Daily, _PP_Full_Daily_R2, _PP_Incr_Daily, _PP_Incr_Daily_R2     Example: "Zdwv_PP_Full"
+   * (A mapping of project space and app name is available — contact the HDL team to confirm your value.)
+* TD_Table_list (required)
+   * The list of source Teradata table names.
+   * Format: JSON array of strings, each in "schema.table" format.
+   * Example: ["td_database.table1", "td_database.table2"]
+* BQ_Table_list (required)
+   * The list of target BigQuery table names.
+   * Format: JSON array of strings, each in "dataset.table" format.
+   * Example: ["bq_dataset.table1", "bq_dataset.table2"]
+   * Must be the same length as TD_Table_list. The two lists are mapped positionally — ensure the order matches.
+   * If a BQ table name is identical to the TD table name, Task 2 skips that entry automatically.
+* Force_Full_Sync (optional, default: "False")
+   * Controls whether to overwrite an existing metadata entry.
+
+
+"True" — Deletes any existing entry for the provided tables and recreates it with fresh details.
+"False" (Default and Recommended) — Only inserts an entry if one does not already exist. Existing entries are left untouched.
+Important notes:
+
+
+TD_Table_list and BQ_Table_list must always have the same number of entries.
+Be careful with the order — lists are mapped positionally (first TD table → first BQ table, and so on).
+Force_Full_Sync = "True" will delete all existing metadata for the provided tables before recreating. Use with caution.
+4. Trigger Flow Summary
+
+1. The user manually triggers a prod DAG via the Airflow UI with a config JSON (see Section 4).
+2. DAG writes to the queue table in BigQuery.
+3. One of the prod pod-specific DAGs (history_load_dag_pod_pp) processes the table.
+4. Metadata and audit entries are generated.
+5. PROD DAGs may handle actual data extraction and load
+
+
+.5. DAG Configuration Format
+The DAG is triggered using a JSON payload via the Airflow UI. All lists are position-based.
+Example JSON:
+{
+"TD_Table_list": ["SOURCE_SCHEMA_01.cust_acct_wallet","SOURCE_SCHEMA_01.mtn_xref”,"SOURCE_SCHEMA_01.mtn_xref"],
+"BQ_Table_list": ["SOURCE_SCHEMA_01.cust_acct_wallet","SOURCE_SCHEMA_01.mtn_xref","SOURCE_SCHEMA_01.mtn_xref"],
+"App_Name": ["Gk1vdo_PP_Full","Gk1vdo_PP_Full",”Enabdo_PP_Full”],
+"Email_id":"user@example.com,user@example.com"
+}
+App_Name And Project Name:
+
+
+Sr.No
+	App_Name
+	Target BQ Project
+	Source TD server
+	User Group
+	Purpose
+	1
+	Zdwvdo_PP_Full
+	PROJECT_ID_02
+	P2
+	UG0
+	Adhoc Full Load Prod
+	2
+	Bglodo_PP_Full
+	PROJECT_ID_03
+	P2
+	UG14
+	Adhoc Full Load Prod
+	3
+	Bgtsdo_PP_Full
+	PROJECT_ID_04
+	P2
+	UG8
+	Adhoc Full Load Prod
+	4
+	Bhubdo_PP_Full
+	PROJECT_ID_05
+	P2
+	UG10
+	Adhoc Full Load Prod
+	5
+	Bopsdo_PP_Full
+	PROJECT_ID_06
+	P2
+	UG13
+	Adhoc Full Load Prod
+	6
+	Bsopdo_PP_Full
+	PROJECT_ID_07
+	P2
+	UG9
+	Adhoc Full Load Prod
+	7
+	Bsyido_PP_Full
+	PROJECT_ID_08
+	P2
+	UG12
+	Adhoc Full Load Prod
+	8
+	Factdo_PP_Full
+	PROJECT_ID_09
+	P2
+	UG15
+	Adhoc Full Load Prod
+	9
+	Fcredo_PP_Full
+	PROJECT_ID_10
+	P2
+	UG16
+	Adhoc Full Load Prod
+	10
+	Ffrado_PP_Full
+	PROJECT_ID_11
+	P2
+	UG17
+	Adhoc Full Load Prod
+	11
+	Frvado_PP_Full
+	PROJECT_ID_12
+	P2
+	UG20
+	Adhoc Full Load Prod
+	12
+	Zdwvdo_PLE_Full
+	PROJECT_ID_01
+	P2
+	UG0
+	Adhoc Full Load Ple
+	13
+	Bglodo_PLE_Full
+	PROJECT_ID_13
+	P2
+	UG14
+	Adhoc Full Load Ple
+	14
+	Bgtsdo_PLE_Full
+	PROJECT_ID_14
+	P2
+	UG8
+	Adhoc Full Load Ple
+	15
+	Bhubdo_PLE_Full
+	PROJECT_ID_15
+	P2
+	UG10
+	Adhoc Full Load Ple
+	16
+	Bopsdo_PLE_Full
+	PROJECT_ID_16
+	P2
+	UG13
+	Adhoc Full Load Ple
+	17
+	Bsopdo_PLE_Full
+	PROJECT_ID_17
+	P2
+	UG9
+	Adhoc Full Load Ple
+	18
+	Bsyido_PLE_Full
+	PROJECT_ID_18
+	P2
+	UG12
+	Adhoc Full Load Ple
+	19
+	Factdo_PLE_Full
+	PROJECT_ID_19
+	P2
+	UG15
+	Adhoc Full Load Ple
+	20
+	Fcredo_PLE_Full
+	PROJECT_ID_20
+	P2
+	UG16
+	Adhoc Full Load Ple
+	21
+	Ffrado_PLE_Full
+	PROJECT_ID_21
+	P2
+	UG17
+	Adhoc Full Load Ple
+	22
+	Frvado_PLE_Full
+	PROJECT_ID_22
+	P2
+	UG20
+	Adhoc Full Load Ple
+	23
+	 Zdwvbizdo_PP_Full_Daily
+	PROJECT_ID_23
+	P2
+	Temp Sync Project all UG
+	Temp Sync Full Load
+	24
+	Bizdo_PP_Full_Daily
+	PROJECT_ID_24
+	P2
+	Temp Sync Project all UG
+	Temp Sync Full Load
+	23
+	 Zdwvbizdo_PP_Incr_Daily
+	PROJECT_ID_23
+	P2
+	Temp Sync Project all UG
+	Temp Sync Incr Load
+	24
+	Bizdo_PP_incr_Daily
+	PROJECT_ID_24
+	P2
+	Temp Sync Project all UG
+	Temp Sync Incr Load
+	
+
+
+
+
+
+
+
+Field Details:
+Key
+	Type
+	Required
+	Description
+	TD_table_list
+	List[str]
+	Yes
+	Teradata table names in db.table format
+	Bq_table_list
+	List[str]
+	Yes
+	Target BigQuery tables in dataset.table format
+	App_name
+	List[str]
+	Yes
+	Application name for project routing
+	Prod_load_flag
+	List[bool]
+	Yes
+	Currently unused — all tables which you have triggered will get copied directly to ple
+	Ple_load_flag
+	List[bool]
+	Yes
+	Currently unused — all tables which you have triggered will get copied directly to ple
+	Email_id
+	Double Quoted Single comma separate String
+	Yes
+	email ids to receive HDL report 
+	
+
+6. How to Trigger
+
+Trigger Method: Airflow UI Only
+
+Trigger one of the following DAGs in Prod via the Airflow UI:
+history_load_dag_pod_pp
+Dag Link: https://88d2d6bbcd55409988c7d409a34bc4ea-dot-us-east4.composer.googleusercontent.com/dags/history_load_dag_pod_pp/grid
+
+Steps:
+1. Open Airflow UI (DTS-2 Composer)
+2. Find the appropriate history_load_dag_pod_pp DAG
+3. Click "Trigger DAG with config"
+4. Paste the JSON configuration into the pop-up and confirm
+
+CLI and API triggering are not supported. All triggering must be done via the Airflow UI.
+
+For access requests, please refer to the document.  
+If there is any failure on this DAG. Please use the following DAG.
+Adhoc Dag:
+This are Dag where you can do HDL in chunks. You have to pass the where condition and it will bring the data using that where condition. Also, you have to pass the tble_load_type parameter which used for loading the table if its passed then it will do truncate and load if it not passed then it will do append in the current data.
+Parquet: https://ffe6b0430c864b4b9c69c9cab4476816-dot-us-east4.composer.googleusercontent.com/dags/history_load_dag_nos_parquet_adhoc_gk1vdo_PP/grid
+Csv: https://ffe6b0430c864b4b9c69c9cab4476816-dot-us-east4.composer.googleusercontent.com/dags/history_load_dag_nos_csv_adhoc_gk1vdo_PP/grid
+Json Configuration: 
+{
+    "BQ_Table": "revrec_prd_tbls.pship_allctn_dtl",
+    "Condition": " where 1=1 ",
+    "Ple_Load_flag": "False",
+    "tbl_load_type": "FullLoad"
+}
+refer the confluence page for more information. 
+
+7. Monitoring & Validation
+
+Monitor the following components:
+- DTS-1,DTS-2Composer: DAG logs, pod task runs
+- Queue Table: Entry presence and pod assignment
+- Metadata Table: Metadata entry creation, load lifecycle
+- Audit Table: Final status of table processing
+- GCS Buckets: Delivery of extracted Parquet files
+- BigQuery (PLE/PROD): Final data load success and validation checks
+
+8. Common Issues & Fixes
+Issue 
+	 Cause 
+	 Resolution 
+	 DAG fails at trigger 
+	 Invalid or malformed JSON config 
+	 Reformat and retry via UI 
+	 Table skipped 
+	 App/pod routing issue or malformed entry 
+	 Check queue and validate App_name 
+	 Missing metadata 
+	 Metadata DAG did not run or failed silently 
+	 Check DAG logs and rerun if needed 
+	 Data not loaded to BQ 
+	 File missing in GCS or BQ load failure 
+	 Trace through logs and audit table 
+	
+
+
+9. Manual Overrides
+
+- Re-trigger the appropriate pod DAG via UI with same or corrected config
+- Queue and audit tables can be updated manually with care and approval
+- DAGs can be rerun safely without duplicate loads due to idempotent logic
+
+
+
+10. New Project OnBoard in HDL. 
+
+1. GCS Bucket: We require one bucket to temporarily store extracted files with a 5-day lifecycle (name suffix:nos-inbound)  link.
+2. Composer Connection ID: A connection ID for GCP projects needs to be set up on both DTS1 and DTS2 composers. This can be done by onboarding the new project on DTS composers. This has to be done by the Data owner of that project. And it's just a marketplace onboard request.
+3. NOS Authorization: We've to create a new authorization on Teradata(TD) specifically for NOS, which can be used during data extraction. This authorization should have write access to the respective project's GCS bucket link.
+<Teradata NOS authorization object with write access to the project GCS bucket>
+service-account@PROJECT_ID.iam.gserviceaccount.com
+4. Cross-Project Read Access (PLE): If a PLE project is available, we will need cross-project read access for the PLE service account to the respective production GCS Bucket.
+5. Production Service Account Read Access: The production service account should have read access to the corresponding GCS bucket to read extracted file data and load it into BQ.
+6. Dataset Creation for Staging and Stored Processors (SP): The following datasets must be created within the new project. This is the project where the Stored Processors will be installed and where the staging tables will be generated during runtime. link 
+SP DatasetName: edw_data_migration_ops_tbls
+Stg Table DatasetName: edw_data_migration_opsstg_tbls 
+7. Add TD connection id on Composer: We need to add TD functional ids as connection on Composer as well to get access to TD. as well kubernetes secrets.
+11. Architecture Diagram:
+  
+
+
+
+
+
+
+________________
+
+12. Temp Sync

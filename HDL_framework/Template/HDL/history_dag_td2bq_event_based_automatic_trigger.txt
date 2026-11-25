@@ -1,0 +1,250 @@
+import logging
+import json
+from datetime import datetime, timedelta
+import random
+import sys
+from airflow import DAG
+from airflow.decorators import task
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.operators.empty import EmptyOperator
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.providers.teradata.hooks.teradata import TeradataHook
+import pandas as pd
+
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_25/"
+sys.path.append(BASE_DIR)
+
+
+def read_config():
+    with open(f'{BASE_DIR}history_load_config_wave_hdl.json', 'r') as f:
+        return json.load(f)
+
+
+config = read_config()
+logger = logging.getLogger("airflow.task")
+
+BQ_CONN_ID = config["hdl_source_connection_id"]
+BQ_PROJECT = config["hdl_source_project"]
+BQ_METADATA_TABLE = f"{BQ_PROJECT}.{config['Metadata_Dataset']}.{config['Metadata_Tbl']}"
+BQ_EVENT_METADATA_TABLE = f"{BQ_PROJECT}.{config['Event_Metadata_Dataset']}.{config['Event_Metadata_Tbl']}"
+BQ_SYNC_METADATA_TABLE = f"{BQ_PROJECT}.{config['Metadata_Dataset']}.{config['Sync_Metadata_Tbl']}"
+function_ids = config["function_ids"]
+TD_CONN_ID = function_ids[random.randint(0, len(function_ids) - 1)]
+
+
+with DAG(
+    dag_id="dg_gk1v_edwdo_td2bq_event_based_automatic_trigger",
+    start_date=datetime(2024, 1, 1),
+    schedule_interval='*/30 * * * *',
+    max_active_runs=1,
+    max_active_tasks=15,
+    catchup=False,
+    description="Parent DAG: poll TD control tables and trigger HDL DAGs for TD→BQ loads",
+) as dag:
+
+    start = EmptyOperator(task_id="start")
+    end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.ALL_DONE)
+
+    @task
+    def fetch_td_updated_tables(**context):
+        """
+        Query the four TD control tables and return rows where status = 'C'
+        (completed) within the current data interval.
+
+        Columns returned (lowercased): processtypecode, processname, status, dw_insert_tms
+        """
+        data_interval_start = context["data_interval_start"].in_timezone("America/New_York")
+        data_interval_end = context["data_interval_end"].in_timezone("America/New_York")
+
+        query = f"""
+        SELECT trim(processtypecode) as processtypecode, trim(processname) as processname, trim(status) as status, dw_insert_tms FROM (
+            SELECT cast('' as varchar(1000)) AS processtypecode,
+                   feed_type AS processname,
+                   CASE WHEN status='Loaded' THEN 'C' ELSE 'F' END AS status,
+                   dw_insert_tms
+            FROM AST.MARKETO_JOB_STATUS
+            UNION ALL
+            SELECT '',
+                   TableName,
+                   CASE WHEN status='Success' THEN 'C' ELSE 'F' END AS status,
+                   dw_insert_tms
+            FROM SOURCE_SCHEMA_03.MARKETO_PRCS_CTRL
+            UNION ALL
+            SELECT prcs_type_code, prcs_name, prcs_stat_code, end_dttm
+            FROM BODS_METADATA_VW.PRCS_CTRL
+            UNION ALL
+            SELECT prcs_type_code, prcs_name, prcs_stat_code, end_dttm
+            FROM EDW_METADATA_VW.PRCS_CTRL
+            UNION ALL
+            SELECT process_name, process_step_desc, 'C', update_timestamp
+            FROM NTL_PRD_QMTBLS.SOUTH_TABLE_LOAD_STATUS
+        ) AS fd
+        WHERE dw_insert_tms BETWEEN '{data_interval_start.strftime('%Y-%m-%d %H:%M:%S')}'
+              AND '{data_interval_end.strftime('%Y-%m-%d %H:%M:%S')}'
+        AND status IN ('C')
+        """
+        print(query)
+        hook = TeradataHook(teradata_conn_id=TD_CONN_ID)
+        conn = hook.get_conn()
+        try:
+            df = pd.read_sql(query, conn)
+            logger.info("TD control tables returned %d completed rows for interval %s → %s",
+                        len(df), data_interval_start, data_interval_end)
+        finally:
+            conn.close()
+
+        if df.empty:
+            logger.warning("No tables completed in TD for interval %s → %s",
+                           data_interval_start, data_interval_end)
+            return []
+
+        df.columns = [c.lower() for c in df.columns]
+        for col in df.select_dtypes(include=['datetime64', 'datetimetz']).columns:
+            df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        return df.to_dict(orient='records')
+
+    @task
+    def fetch_bq_event_metadata():
+        """
+        Fetch active event-based metadata from BQ.
+
+        Joins:
+          historical_load_event_based_metadata_table  (evt columns)
+            → historical_load_metadata_table           (adds app_name)
+            → historical_load_temp_sync_metadata_table (adds dag_filename)
+
+        The dag_filename column holds the DAG filename
+        (e.g. history_load_dag__SCHEMA_TABLE_daily_Fullload.py) which is used
+        to derive the trigger_dag_id.
+        """
+        query = f"""
+        SELECT
+            evt.bq_table_full_name,
+            evt.td_table_full_name,
+            evt.process_type_code,
+            evt.process_name,
+            evt.control_table_name,
+            evt.time_interval_minutes,
+            mtd.app_name,
+            mtd.load_type,
+            mtd.load_functionality,
+            sync.dag_filename
+        FROM `{BQ_EVENT_METADATA_TABLE}` evt
+        JOIN `{BQ_METADATA_TABLE}` mtd
+          ON evt.bq_table_full_name = CONCAT(mtd.tgt_project_id,'.',mtd.tgt_schema, '.', mtd.tgt_table)
+        LEFT JOIN `{BQ_SYNC_METADATA_TABLE}` sync
+          ON evt.bq_table_full_name = sync.bq_table_full_name
+         AND sync.is_active = TRUE
+        WHERE evt.is_active = TRUE
+        """
+
+        hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID)
+        df = hook.get_pandas_df(sql=query, dialect="standard", location="US")
+        logger.info("BQ event metadata returned %d active records", len(df))
+
+        if df.empty:
+            logger.warning("BQ event metadata table returned no active records")
+            return []
+
+        df.columns = [c.lower() for c in df.columns]
+        for col in df.select_dtypes(include=['datetime64', 'datetimetz']).columns:
+            df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        return df.to_dict(orient='records')
+
+    @task
+    def join_and_prepare_triggers(td_records: list, bq_records: list):
+        """
+        Inner-join TD completed tables with BQ event metadata to build the
+        trigger list for TriggerDagRunOperator.expand_kwargs().
+
+        Join key:
+          TD  processname  ==  BQ  process_name
+          (from historical_load_event_based_metadata_table)
+
+        Trigger DAG ID is derived from dag_filename by stripping the .py extension.
+        Rows without a dag_filename are logged and skipped.
+        Results are deduplicated so each DAG is triggered at most once per run.
+        """
+        if not td_records:
+            logger.info("No TD completed tables in this interval — nothing to trigger")
+            return []
+        if not bq_records:
+            logger.info("No active BQ event metadata records — nothing to trigger")
+            return []
+
+        df_td = pd.DataFrame(td_records)
+        df_bq = pd.DataFrame(bq_records)
+
+        df_td['processname'] = df_td['processname'].str.strip().str.lower()
+        df_bq['process_name'] = df_bq['process_name'].str.strip().str.lower()
+
+        joined = df_td.merge(
+            df_bq,
+            left_on='processname',
+            right_on='process_name',
+            how='inner'
+        )
+
+        if joined.empty:
+            logger.info(
+                "No overlap between %d TD process names and %d BQ event metadata entries",
+                len(df_td), len(df_bq)
+            )
+            return []
+
+        logger.info("Matched %d rows across TD and BQ metadata", len(joined))
+
+        seen_dag_ids = set()
+        trigger_list = []
+        for _, row in joined.iterrows():
+            dag_filename = row.get("dag_filename")
+            if not dag_filename:
+                logger.warning(
+                    "dag_filename is NULL for bq_table_full_name=%s (process_name=%s) — "
+                    "ensure historical_load_temp_sync_metadata_table has an entry for this table",
+                    row.get("bq_table_full_name"), row.get("process_name")
+                )
+                continue
+
+            dag_id = dag_filename.replace(".py", "") if dag_filename.endswith(".py") else dag_filename
+
+            # One trigger per unique DAG per run
+            if dag_id in seen_dag_ids:
+                logger.info("Skipping duplicate trigger for dag_id=%s", dag_id)
+                continue
+            seen_dag_ids.add(dag_id)
+
+            trigger_list.append({
+                "trigger_dag_id": dag_id,
+                "conf": {
+                    "bq_table_full_name": row.get("bq_table_full_name"),
+                    "td_table_full_name": row.get("td_table_full_name"),
+                    "process_name": row.get("process_name"),
+                    "process_type_code": row.get("process_type_code"),
+                    "app_name": row.get("app_name"),
+                    "load_type": row.get("load_type"),
+                    "load_functionality": row.get("load_functionality"),
+                    "dw_insert_tms": str(row.get("dw_insert_tms", "")),
+                },
+            })
+
+        logger.info("Prepared %d unique HDL DAG triggers", len(trigger_list))
+        return trigger_list
+
+    td_records = fetch_td_updated_tables()
+    bq_records = fetch_bq_event_metadata()
+    trigger_list = join_and_prepare_triggers(td_records, bq_records)
+
+    trigger_hdl_dags = TriggerDagRunOperator.partial(
+        task_id="trigger_hdl_dag",
+        wait_for_completion=False,
+        poke_interval=60,
+        execution_timeout=timedelta(hours=6),
+        retries=0,
+    ).expand_kwargs(trigger_list)
+
+    start >> [td_records, bq_records]
+    trigger_list >> trigger_hdl_dags >> end

@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS edw_data_migration_ops_tbls.table_schedule_config (
+    table_list STRING NOT NULL,
+    cron_schedule STRING NOT NULL,
+    start_date DATE Default current_date
+	end_date DATE NOT NULL
+);

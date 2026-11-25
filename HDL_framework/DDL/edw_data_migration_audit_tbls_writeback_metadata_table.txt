@@ -1,0 +1,19 @@
+CREATE TABLE IF NOT EXISTS edw_data_migration_audit_tbls.edw_mig_bq_to_td_writeback_metadata
+(
+  project_name                STRING,
+  bq_table_name               STRING,
+  td_table_name               STRING,
+  writeback_dag_name          STRING,
+  load_type                   STRING,
+  load_functionality          STRING,
+  function_id                 STRING,
+  is_active                   BOOL,
+  writeback_composer_instance STRING,
+  schedule                    STRING,
+  where_condition             STRING,
+  delta_column                STRING,
+  delta_column_type           STRING,
+  delta_interval              INT64,
+  load_instances              INT64,
+  app_name                    STRING
+);

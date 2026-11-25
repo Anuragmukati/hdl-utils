@@ -1,0 +1,25 @@
+CREATE TABLE IF NOT EXISTS edw_data_migration_audit_tbls.historical_load_audit_table( 
+dag_id STRING,
+    dag_run_id STRING,
+    dag_run_type STRING,
+    table_uid STRING,
+    data_loading_state STRING,
+    proc_run_id INT64,
+    delta_column_max_value STRING,
+    delta_where_condition STRING,
+    stg_schema STRING,
+    stg_table STRING,
+    tgt_schema STRING,
+    tgt_table STRING,
+    start_time TIMESTAMP,
+    end_time TIMESTAMP,
+    src_row_count INT64,
+    tgt_row_count INT64,
+    is_row_count_matched BOOL,
+    error_message STRING,
+    job_status STRING,
+    load_type STRING,
+    pelican_trigger_id STRING,
+    td_functional_id STRING
+	);
+	

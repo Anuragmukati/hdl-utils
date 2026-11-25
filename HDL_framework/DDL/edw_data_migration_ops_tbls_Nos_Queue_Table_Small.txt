@@ -1,0 +1,11 @@
+CREATE TABLE IF NOT EXISTS edw_data_migration_ops_tbls.Nos_Queue_Table_Small(
+table_uid        String NOT NULL,
+dag_run_id String NOT NULL,
+table_dataset        String NOT	NULL,
+table_name        String NOT NULL,
+app_name        String,
+ple_load Bool Default True,
+prod_load Bool Default False,
+insert_dt Datetime Default current_datetime,
+status String Default 'INCOMPLETE'
+);

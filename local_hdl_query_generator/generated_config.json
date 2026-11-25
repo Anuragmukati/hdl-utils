@@ -1,0 +1,27 @@
+{
+    "ple_flag": "1",
+    "project": "gk1v",
+    "email": "anurag.mukati@verizon.com",
+    "table_metadata_dict": [
+        {
+            "td_schema_name": "udm_prd_tbls",
+            "td_table_name": "od_vpp_partner_info",
+            "bq_schema_name": "udm_prd_tbls",
+            "bq_table_name": "od_vpp_partner_info",
+            "fetch_query": "SELECT  CASE WHEN RTRIM(\"PARTNER_ID\") = '' THEN ' ' ELSE RTRIM(\"PARTNER_ID\") END AS \"PARTNER_ID\",  RTRIM(\"PARTNER_TYPE_DESC\") AS \"PARTNER_TYPE_DESC\",  RTRIM(\"ACCT_STATUS_DESC\") AS \"ACCT_STATUS_DESC\",  RTRIM(\"VPP_TERRITORY_CD\") AS \"VPP_TERRITORY_CD\",  CAST(CAST(\"MASTER_CONTRACT_START_TS\" AS TIMESTAMP FORMAT 'YYYY-MM-DDBHH:MI:SS.S(6)') AS VARCHAR(50)) AS \"MASTER_CONTRACT_START_TS\",  RTRIM(\"PARTNER_INDUSTRY_DESC\") AS \"PARTNER_INDUSTRY_DESC\",  RTRIM(\"PARTNER_PROD_GRP_DESC\") AS \"PARTNER_PROD_GRP_DESC\",  RTRIM(\"CO_NM\") AS \"CO_NM\",  RTRIM(\"VPP_STATE_CD\") AS \"VPP_STATE_CD\",  RTRIM(\"VPP_AREA_NM\") AS \"VPP_AREA_NM\",  RTRIM(\"LEGACY_VPP_PARTNER_ID\") AS \"LEGACY_VPP_PARTNER_ID\",  CAST(\"INSERT_DT\" AS DATE FORMAT 'YYYY-MM-DD') AS \"INSERT_DT\",  CAST(\"LAST_UPD_DT\" AS DATE FORMAT 'YYYY-MM-DD') AS \"LAST_UPD_DT\",  CAST(\"MASTER_CONTRACT_START_DT\" AS DATE FORMAT 'YYYY-MM-DD') AS \"MASTER_CONTRACT_START_DT\",  CAST(\"MASTER_CONTRACT_END_DT\" AS DATE FORMAT 'YYYY-MM-DD') AS \"MASTER_CONTRACT_END_DT\",  CAST(CAST(\"MASTER_CONTRACT_END_TS\" AS TIMESTAMP FORMAT 'YYYY-MM-DDBHH:MI:SS.S(6)') AS VARCHAR(50)) AS \"MASTER_CONTRACT_END_TS\" FROM  UDM_PRD_TBLS.OD_VPP_PARTNER_INFO",
+            "LoadType": "FULL_LOAD",
+            "partition_column": "NA",
+            "partition_type": "NA",
+            "partition_format": "NA",
+            "partition_minvalue": "NA",
+            "partition_range": "NA",
+            "status": "INCOMPLETE",
+            "appname": "NOS_First",
+            "DateRequested": "2026-09-18 09:56:35 UTC",
+            "DateCompleted": "2026-09-18 09:56:35 UTC",
+            "schema_fields": "Not Found",
+            "table_size": "Large",
+            "partition_maxvalue": "NA"
+        }
+    ]
+}

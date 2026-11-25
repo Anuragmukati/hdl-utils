@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS edw_data_migration_audit_tbls.edw_mig_bq_to_td_writeback_audit
+(
+  bq_table_name                  STRING,
+  td_table_name                  STRING,
+  writeback_status               STRING,
+  data_size_gb                   STRING,
+  bq_count                       STRING,
+  td_count                       STRING,
+  functional_id                  STRING,
+  composer_instance              STRING,
+  writeback_dag_name             STRING,
+  audit_ts                       TIMESTAMP,
+  last_update_ts                 DATETIME,
+  load_type                      STRING,
+  load_functionality             STRING,
+  start_time                     DATETIME,
+  execution_hour                 STRING,
+  table_last_modified_when_wb    TIMESTAMP,
+  end_time                       DATETIME,
+  trigger_type                   STRING,
+  max_tls                        DATETIME
+);

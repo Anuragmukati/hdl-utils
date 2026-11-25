@@ -1,0 +1,496 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowFailException, AirflowSkipException
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.utils.email import send_email
+from datetime import datetime
+import json
+import re
+
+SOURCE_DIR  = "/home/airflow/gcs/dags/PROJECT_ID_25"
+CONFIG_PATH = f"{SOURCE_DIR}/history_load_config_wave_hdl.json"
+
+def _read_config():
+    with open(CONFIG_PATH, "r") as f:
+        return json.load(f)
+
+config = _read_config()
+
+HDL_CONN          = config["hdl_source_connection_id"]
+HDL_PROJECT       = config["hdl_source_project"]
+METADATA_DATASET  = config["Metadata_Dataset"]
+SYNC_METADATA_TBL = config["Sync_Metadata_Tbl"]
+TABLE_SIZE_TBL    = config["large_table_size"]
+COMPOSER_BUCKET   = config["Composer_Bucket"]
+GCS_DAGS_PREFIX   = "dags"
+
+SYNC_METADATA_TABLE  = f"{HDL_PROJECT}.{METADATA_DATASET}.{SYNC_METADATA_TBL}"
+TABLE_SIZE_TABLE     = f"{HDL_PROJECT}.{METADATA_DATASET}.{TABLE_SIZE_TBL}"
+FULLLOAD_MAX_SIZE_GB = config["large_table_size"]
+
+LOAD_TYPE_FOLDER = {
+    "Fullload":           "Fullload",
+    "Incr_Append_Delete": "Incremental",
+    "Incr_Append":        "Incremental",
+}
+
+LOAD_TYPE_TEMPLATE = {
+    "Fullload":           "Fullload_template.txt",
+    "Incr_Append_Delete": "incremental_template.txt",
+    "Incr_Append":        "incremental_template.txt",
+}
+
+
+VALID_LOBS = ["VCG", "BODS", "VBG"]
+
+LOB_BQ_PROJECT = {
+    "VCG":  "PROJECT_ID_24",
+    "BODS": "PROJECT_ID_24",
+    "VBG":  "PROJECT_ID_23",
+}
+
+LOB_APP_NAME = {
+    ("VCG",  True):  "Gk1vbizdo_PP_Full_Daily",
+    ("VCG",  False): "Gk1vbizdo_PP_Incr_Daily",
+    ("BODS", True):  "Gk1vbizdo_PP_Full_Daily",
+    ("BODS", False): "Gk1vbizdo_PP_Incr_Daily",
+    ("VBG",  True):  "Zdwvbizdo_PP_Full_Daily",
+    ("VBG",  False): "Zdwvbizdo_PP_Incr_Daily",
+}
+
+
+def _get_app_name(lob: str, load_type: str) -> str:
+    lob_upper = lob.upper().strip()
+    is_full   = load_type.strip().upper() == "FULLLOAD"
+    app_name  = LOB_APP_NAME.get((lob_upper, is_full))
+    if app_name is None:
+        raise ValueError(f"Invalid LOB: '{lob}'. Valid values: {', '.join(VALID_LOBS)}")
+    return app_name
+
+
+def _safe_job_id(job_id: str, max_len: int = 30) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_\-]", "_", str(job_id))
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return slug[:max_len]
+
+
+# ── Task 1 — read_active_metadata ─────────────────────────────────────────────
+def read_active_metadata(**kwargs):
+    ti = kwargs["ti"]
+
+    hook   = BigQueryHook(gcp_conn_id=HDL_CONN, use_legacy_sql=False)
+    conn   = hook.get_conn()
+    cursor = conn.cursor()
+
+    query = (
+        f"SELECT bq_table_full_name, td_table_full_name, load_type, app_name, "
+        f"       schedule_interval, job_id, job_description, User_Group, "
+        f"       replication_type, dag_filename, requested_by, LOB "
+        f"FROM `{SYNC_METADATA_TABLE}` "
+        f"WHERE is_active = TRUE "
+        f"ORDER BY bq_table_full_name"
+    )
+
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    columns = [
+        "bq_table_full_name", "td_table_full_name", "load_type", "app_name",
+        "schedule_interval", "job_id", "job_description", "User_Group",
+        "replication_type", "dag_filename", "requested_by", "LOB",
+    ]
+
+    active_tables = [dict(zip(columns, row)) for row in rows]
+
+    print(f"\n{'='*60}")
+    print(f"  Found {len(active_tables)} active entry(ies) in {SYNC_METADATA_TBL}")
+    print(f"{'='*60}")
+    for t in active_tables:
+        print(f"  - {t['bq_table_full_name']}  [{t['load_type']}]")
+
+    if not active_tables:
+        raise AirflowSkipException(
+            f"No active entries found in {SYNC_METADATA_TBL}. Nothing to regenerate."
+        )
+
+    ti.xcom_push(key="active_tables", value=active_tables)
+
+
+# ── Task 2 — check_table_sizes ────────────────────────────────────────────────
+# For every Fullload entry, look up the TD table size in dbc_tablesizev.
+# Tables exceeding FULLLOAD_MAX_SIZE_GB are blocked and added to failed_tables
+# with a clear error message. All other tables pass through to valid_tables.
+def check_table_sizes(**kwargs):
+    ti            = kwargs["ti"]
+    active_tables = ti.xcom_pull(task_ids="read_active_metadata", key="active_tables") or []
+
+    hook   = BigQueryHook(gcp_conn_id=HDL_CONN, use_legacy_sql=False)
+    conn   = hook.get_conn()
+    cursor = conn.cursor()
+
+    fullload_tables = [
+        t for t in active_tables
+        if str(t.get("load_type", "")).strip().upper() == "FULLLOAD"
+    ]
+
+    size_map = {}  # "db.tbl" (lower) → size_gb
+    if fullload_tables:
+        td_in_values = []
+        for t in fullload_tables:
+            parts = str(t["td_table_full_name"]).split(".", 1)
+            if len(parts) == 2:
+                td_in_values.append(f"'{parts[0].lower()}.{parts[1].lower()}'")
+
+        if td_in_values:
+            size_sql = (
+                f"SELECT LOWER(TRIM(databasename)), LOWER(TRIM(tablename)), "
+                f"       COALESCE(SUM(total_size_GB), 0) AS size_gb "
+                f"FROM `{TABLE_SIZE_TABLE}` "
+                f"WHERE LOWER(CONCAT(TRIM(databasename), '.', TRIM(tablename))) "
+                f"      IN ({', '.join(td_in_values)}) "
+                f"GROUP BY 1, 2"
+            )
+            try:
+                cursor.execute(size_sql)
+                for row in cursor.fetchall():
+                    size_map[f"{row[0]}.{row[1]}"] = float(row[2])
+                print(f"[INFO] Fetched sizes for {len(size_map)} Fullload TD table(s) from {TABLE_SIZE_TBL}")
+            except Exception as e:
+                print(f"[WARN] Could not fetch table sizes from {TABLE_SIZE_TBL}: {e}. Proceeding without size check.")
+
+    valid_tables  = []
+    failed_tables = []
+
+    for t in active_tables:
+        bq_label  = t["bq_table_full_name"]
+        load_type = str(t.get("load_type", "")).strip().upper()
+
+        if load_type == "FULLLOAD":
+            td_parts = str(t["td_table_full_name"]).split(".", 1)
+            key      = f"{td_parts[0].lower()}.{td_parts[1].lower()}" if len(td_parts) == 2 else ""
+            size_gb  = size_map.get(key, 0.0)
+
+            if size_gb > FULLLOAD_MAX_SIZE_GB:
+                msg = (
+                    f"Table too big to set up FullLoad "
+                    f"(TD size: {size_gb:.1f} GB exceeds limit of {FULLLOAD_MAX_SIZE_GB} GB). "
+                    f"Use Incr_Append or Incr_Append_Delete instead, or request an exception."
+                )
+                print(f"[BLOCKED] '{bq_label}': {msg}")
+                failed_tables.append({
+                    "table":         bq_label,
+                    "td_table":      t["td_table_full_name"],
+                    "load_type":     t["load_type"],
+                    "size_gb":       size_gb,
+                    "stage":         "size_check",
+                    "error_message": msg,
+                })
+                continue
+
+        valid_tables.append(t)
+
+    print(f"\n{'='*60}")
+    print(f"  Size check — valid: {len(valid_tables)}, blocked (oversized): {len(failed_tables)}")
+    print(f"{'='*60}\n")
+
+    ti.xcom_push(key="valid_tables",  value=valid_tables)
+    ti.xcom_push(key="failed_tables", value=failed_tables)
+
+    if not valid_tables:
+        raise AirflowSkipException("All tables blocked by size check. Nothing to regenerate.")
+
+
+# ── Task 3 — regenerate_and_upload_dags ───────────────────────────────────────
+# Re-renders each valid entry's DAG template using the values already stored in
+# the sync metadata table and re-uploads it to the same GCS path.
+def regenerate_and_upload_dags(**kwargs):
+    ti            = kwargs["ti"]
+    valid_tables  = ti.xcom_pull(task_ids="check_table_sizes", key="valid_tables")  or []
+    failed_tables = ti.xcom_pull(task_ids="check_table_sizes", key="failed_tables") or []
+
+    regenerated_tables = []
+
+    for t in valid_tables:
+        bq_label  = t["bq_table_full_name"]
+        load_type = str(t.get("load_type", "")).strip()
+        lob       = str(t.get("LOB", "")).strip().upper()
+
+        if load_type not in LOAD_TYPE_TEMPLATE:
+            msg = f"Unknown load_type '{load_type}' — no template mapped."
+            print(f"[FAILED] '{bq_label}': {msg}")
+            failed_tables.append({
+                "table": bq_label, "td_table": t["td_table_full_name"],
+                "load_type": load_type, "stage": "regeneration", "error_message": msg,
+            })
+            continue
+
+        try:
+            app_name   = _get_app_name(lob, load_type)
+            prj_key    = app_name.split("_")[0].lower()
+            dag_folder = config[f"dag_folder_{prj_key}"]
+            gcs_conn   = config[f"GCP_CONN_DO_ID_{prj_key}"]
+
+            prj = prj_key
+            rep = ""
+            if "_r2" in prj:
+                rep = "_R2"
+                prj = prj.replace("_r2", "")
+
+            parts                = bq_label.split(".")
+            db_nm                = parts[-2]
+            tbl_nm               = parts[-1]
+            table_name_formatted = f"{db_nm}__{tbl_nm}"
+            job_ref              = str(t.get("job_id", "")).strip()
+            job_id_slug          = _safe_job_id(job_ref)
+            job_id_suffix        = f"_{job_id_slug}"
+            rep_type          = str(t.get("replication_type") or "time-driven").strip()
+            schedule_interval = (
+                "None" if rep_type == "event-driven"
+                else str(t.get("schedule_interval") or "00 00 * * *").strip()
+            )
+            job_description      = str(
+                t.get("job_description") or f"Run daily sync for {table_name_formatted} - {job_ref}"
+            ).strip()
+
+            template_file = LOAD_TYPE_TEMPLATE[load_type]
+            template_path = f"{SOURCE_DIR}/Template/{template_file}"
+            with open(template_path, "r") as f:
+                content = f.read()
+
+            job_info_comment = (
+                f"# job_ref           : {job_ref}\n"
+                f"# job_description   : {job_description}\n"
+                f"# app_name          : {app_name}\n"
+                f"# LOB               : {lob}\n"
+                f"# replication_type  : {rep_type}\n"
+                f"# last_updated      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+
+            suffix        = "event" if rep_type == "event-driven" else "daily"
+
+            content = job_info_comment + content
+            content = content.replace("@Table_Name",        table_name_formatted)
+            content = content.replace("@tbl_uid",           table_name_formatted)
+            content = content.replace("@Table_type",        load_type)
+            content = content.replace("@dag_suffix",        suffix)
+            if rep_type == "event-driven":
+                # Strip the surrounding quotes so the output is  schedule_interval=None
+                # not  schedule_interval='None' / schedule_interval="None"
+                content = content.replace('"@schedule_interval"', 'None')
+                content = content.replace("'@schedule_interval'", 'None')
+                content = content.replace("@schedule_interval",   'None')
+            else:
+                content = content.replace("@schedule_interval", schedule_interval)
+            content = content.replace("@prj",               prj)
+            content = content.replace("@job_id",            job_id_suffix)
+            if load_type.lower() == "fullload":
+                content = content.replace("@rep", rep)
+
+            dag_filename  = str(
+                t.get("dag_filename") or f"history_load_dag__{db_nm}__{tbl_nm}_{suffix}_{load_type}.py"
+            ).strip()
+            output_folder = LOAD_TYPE_FOLDER[load_type]
+            gcs_object    = f"{GCS_DAGS_PREFIX}/{dag_folder}/{output_folder}/{dag_filename}"
+
+            hook = GCSHook(gcp_conn_id=gcs_conn)
+            hook.upload(
+                bucket_name=COMPOSER_BUCKET,
+                object_name=gcs_object,
+                data=content.encode("utf-8"),
+                mime_type="text/x-python",
+            )
+
+            print(f"[REGENERATED] '{bq_label}' → gs://{COMPOSER_BUCKET}/{gcs_object}")
+            regenerated_tables.append({
+                "table":        bq_label,
+                "td_table":     t["td_table_full_name"],
+                "load_type":    load_type,
+                "dag_filename": dag_filename,
+                "gcs_object":   gcs_object,
+            })
+
+        except Exception as e:
+            print(f"[FAILED]      '{bq_label}': {e}")
+            failed_tables.append({
+                "table": bq_label, "td_table": t["td_table_full_name"],
+                "load_type": load_type, "stage": "regeneration", "error_message": str(e),
+            })
+
+    print(f"\n{'='*60}")
+    print(f"  DAG REGENERATION — Regenerated: {len(regenerated_tables)}, Failed: {len(failed_tables)}")
+    print(f"{'='*60}\n")
+
+    ti.xcom_push(key="regenerated_tables", value=regenerated_tables)
+    ti.xcom_push(key="failed_tables",      value=failed_tables)
+
+
+# ── Task 4 — send_summary_email ───────────────────────────────────────────────
+def send_summary_email(**kwargs):
+    ti     = kwargs["ti"]
+    params = kwargs["dag_run"].conf
+
+    email_id = str(params.get("email_id") or "").strip()
+
+    active_tables      = ti.xcom_pull(task_ids="read_active_metadata",     key="active_tables")      or []
+    regenerated_tables = ti.xcom_pull(task_ids="regenerate_and_upload_dags", key="regenerated_tables") or []
+    failed_tables      = (
+        ti.xcom_pull(task_ids="regenerate_and_upload_dags", key="failed_tables") or
+        ti.xcom_pull(task_ids="check_table_sizes",          key="failed_tables") or
+        []
+    )
+
+    total        = len(active_tables)
+    regen_count  = len(regenerated_tables)
+    failed_count = len(failed_tables)
+
+    print("=" * 60)
+    print("  TEMP SYNC DAG REGENERATION SUMMARY")
+    print(f"  Total active entries : {total}")
+    print(f"  Regenerated          : {regen_count}")
+    print(f"  Failed / Blocked     : {failed_count}")
+    if regenerated_tables:
+        print("\n  Regenerated DAGs:")
+        for t in regenerated_tables:
+            print(f"    + {t['table']}  [{t['load_type']}]  →  {t.get('dag_filename', '')}")
+    if failed_tables:
+        print("\n  Failed / Blocked tables:")
+        for t in failed_tables:
+            print(f"    x [{t.get('stage', '?')}] {t['table']} — {t.get('error_message', '')}")
+    print("=" * 60)
+
+    if failed_tables:
+        raise AirflowFailException(
+            f"Regeneration completed with {failed_count} failure(s). "
+            f"Regenerated: {regen_count}/{total}. Check logs for details."
+        )
+
+    if not email_id:
+        print("No email_id provided — skipping summary email.")
+        return
+
+    STATUS_COLOR = {"Regenerated": "#d4edda", "Failed": "#f8d7da"}
+
+    detail_rows = []
+    for t in regenerated_tables:
+        detail_rows.append({
+            "table": t["table"], "td_table": t.get("td_table", ""),
+            "load_type": t["load_type"], "dag_filename": t.get("dag_filename", ""),
+            "status": "Regenerated", "error_message": "",
+        })
+    for t in failed_tables:
+        detail_rows.append({
+            "table": t["table"], "td_table": t.get("td_table", ""),
+            "load_type": t.get("load_type", ""), "dag_filename": "",
+            "status": "Failed", "error_message": t.get("error_message", ""),
+        })
+
+    detail_html = "".join(
+        f"<tr style='background-color:{STATUS_COLOR.get(r['status'], '#fff')}'>"
+        f"<td>{i + 1}</td>"
+        f"<td>{r['table']}</td>"
+        f"<td>{r['td_table']}</td>"
+        f"<td>{r['load_type']}</td>"
+        f"<td>{r['dag_filename']}</td>"
+        f"<td><b>{r['status']}</b></td>"
+        f"<td style='text-align:left'>{r['error_message']}</td>"
+        f"</tr>"
+        for i, r in enumerate(detail_rows)
+    ) or "<tr><td colspan='7'>No data</td></tr>"
+
+    html = f"""
+    <html>
+    <style>
+      body {{ font-family: Arial, sans-serif; }}
+      table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
+      th {{ border: 2px solid #000; background-color: #b3d9ff; padding: 8px; text-align: center; }}
+      td {{ border: 1px solid #999; padding: 8px; text-align: center; vertical-align: top; }}
+    </style>
+    <body>
+      <h2>Temp Sync DAG Regenerator — Run Summary</h2>
+
+      <table style="width:30%">
+        <tr style="background-color:#88CEEB"><td><b>Metric</b></td><td><b>Count</b></td></tr>
+        <tr><td>Total Active Entries</td><td>{total}</td></tr>
+        <tr style="background-color:#d4edda"><td>Regenerated</td><td>{regen_count}</td></tr>
+        <tr style="background-color:#f8d7da"><td>Failed / Blocked</td><td>{failed_count}</td></tr>
+      </table>
+
+      <h3>Table Details</h3>
+      <table>
+        <tr>
+          <th>Sr.</th>
+          <th>BQ Table</th>
+          <th>TD Table</th>
+          <th>Load Type</th>
+          <th>DAG Filename</th>
+          <th>Status</th>
+          <th>Error Message</th>
+        </tr>
+        {detail_html}
+      </table>
+
+      <p style="font-size:9px;text-align:center">
+        System generated — do not reply<br>
+        HDL Temp Sync DAG Regenerator
+      </p>
+    </body>
+    </html>
+    """
+
+    recipients = [e.strip() for e in email_id.split(",") if e.strip()]
+    send_email(to=recipients, subject="HDL Temp Sync — DAG Regeneration Summary", html_content=html)
+    print(f"Summary email sent to: {recipients}")
+
+
+# ── DAG definition ─────────────────────────────────────────────────────────────
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "start_date": datetime(2025, 4, 9),
+    "retries": 0,
+}
+
+dag = DAG(
+    dag_id="Historical_Temp_Sync_Dag_Regenerator",
+    default_args=default_args,
+    description=(
+        "Reads all active entries from the temp sync metadata table and regenerates "
+        "their DAG files. Fullload tables exceeding 800 GB are blocked with an error."
+    ),
+    schedule_interval=None,
+    catchup=False,
+    params={
+        "email_id": "user@example.com",
+    },
+)
+
+read_metadata = PythonOperator(
+    task_id="read_active_metadata",
+    python_callable=read_active_metadata,
+    provide_context=True,
+    dag=dag,
+)
+
+size_check = PythonOperator(
+    task_id="check_table_sizes",
+    python_callable=check_table_sizes,
+    provide_context=True,
+    dag=dag,
+)
+
+regenerate = PythonOperator(
+    task_id="regenerate_and_upload_dags",
+    python_callable=regenerate_and_upload_dags,
+    provide_context=True,
+    dag=dag,
+)
+
+summary = PythonOperator(
+    task_id="send_summary_email",
+    python_callable=send_summary_email,
+    provide_context=True,
+    trigger_rule="all_done",
+    dag=dag,
+)
+
+read_metadata >> size_check >> regenerate >> summary

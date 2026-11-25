@@ -1,0 +1,10 @@
+if [ -z "$1" ]; then
+        echo "please provide Table List"
+        exit 1
+fi
+if [ -z "$2" ]; then
+        echo "please provide App_Name"
+        exit 1
+fi
+
+sh bq_query.sh "delete from PROJECT_ID_31.edw_data_migration_ops_tbls.historical_load_metadata_table where concat(tgt_schema,'.',tgt_table) in ($1) and app_name='$2'"

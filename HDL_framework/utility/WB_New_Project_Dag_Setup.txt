@@ -1,0 +1,439 @@
+import re
+import json
+from datetime import datetime
+from airflow import DAG
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.exceptions import AirflowFailException
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+
+SOURCE_DIR      = "/home/airflow/gcs/dags/PROJECT_ID_25"
+CONFIG_PATH     = f"{SOURCE_DIR}/history_load_config_wave_wb.json"
+GCS_DAGS_PREFIX = "dags"
+OUTPUT_FOLDER   = "WB"
+
+# All WB framework DAGs are deployed to the zdwvdo project folder — never to per-project folders
+DEPLOY_PROJECT      = "zdwvdo"
+# All WB templates live under COMPOSER_BUCKET/dags/PROJECT_ID_25/Template/ ONLY
+TEMPLATE_GCS_PREFIX = f"{GCS_DAGS_PREFIX}/PROJECT_ID_25/Template"
+
+# load_instance 0 = scheduled DAGs; 1-4 = auto trigger priority levels (one DAG each)
+# Template filename → generated DAG filename (for single-instance templates)
+TEMPLATES = {
+    "manual_trigger_writeback_utility_template.txt":
+        "dg_{prj}_bq2td_manual_trigger_writeback_utility.py",
+    "writeback_dag_generation_utility_template.txt":
+        "writeback_dag_generation_utility_{prj}.py",
+    "scheduled_dag_audit_template.txt":
+        "dg_{prj}_writeback_scheduled_dag_audit.py",
+}
+
+# Auto trigger is generated once per priority level per project.
+# load_instance → schedule_interval
+AUTO_TRIGGER_LEVELS = {
+    1: "*/30 * * * *",   # critical   — every 30 min
+    2: "10 * * * *",     # high       — every 1 hr
+    3: "10 */2 * * *",   # medium     — every 2 hr
+    4: "10 */4 * * *",   # low        — every 4 hr
+}
+
+PRJ_REQUIRED_KEYS = [
+    "GCP_CONN_DO_ID_{prj}",
+    "bq_prod_project_{prj}",
+    "gcs_bucket_name_{prj}",
+    "dag_folder_{prj}",
+]
+
+
+def _load_config():
+    with open(CONFIG_PATH, "r") as f:
+        return json.load(f)
+
+
+def _all_projects_in_config(config):
+    """Return every project that has all required keys present in config."""
+    candidates = [
+        k.replace("GCP_CONN_DO_ID_", "")
+        for k in config
+        if k.startswith("GCP_CONN_DO_ID_")
+    ]
+    valid = []
+    for prj in candidates:
+        if all(k.format(prj=prj) in config for k in PRJ_REQUIRED_KEYS):
+            valid.append(prj)
+    return sorted(valid)
+
+
+def _replace_project(content, prj):
+    """Replace the project = "..." assignment in a template with the given prj."""
+    return re.sub(
+        r'^(project\s*=\s*)"[^"]*"',
+        f'\\1"{prj}"',
+        content,
+        flags=re.MULTILINE,
+    )
+
+
+# DDL for the two tables that must exist in every project space
+_METADATA_DDL = """
+CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{table}`
+(
+  project_name                STRING,
+  bq_table_name               STRING,
+  td_table_name               STRING,
+  writeback_dag_name          STRING,
+  load_type                   STRING,
+  load_functionality          STRING,
+  function_id                 STRING,
+  is_active                   BOOL,
+  writeback_composer_instance STRING,
+  schedule                    STRING,
+  where_condition             STRING,
+  delta_column                STRING,
+  delta_column_type           STRING,
+  delta_interval              INT64,
+  load_instances              INT64,
+  app_name                    STRING
+)
+"""
+
+_AUDIT_DDL = """
+CREATE TABLE IF NOT EXISTS `{project}.{dataset}.{table}`
+(
+  bq_table_name                  STRING,
+  td_table_name                  STRING,
+  writeback_status               STRING,
+  data_size_gb                   STRING,
+  bq_count                       STRING,
+  td_count                       STRING,
+  functional_id                  STRING,
+  composer_instance              STRING,
+  writeback_dag_name             STRING,
+  audit_ts                       TIMESTAMP,
+  last_update_ts                 DATETIME,
+  load_type                      STRING,
+  load_functionality             STRING,
+  start_time                     DATETIME,
+  execution_hour                 STRING,
+  table_last_modified_when_wb    TIMESTAMP,
+  end_time                       DATETIME,
+  trigger_type                   STRING,
+  max_tls                        DATETIME
+)
+"""
+
+
+def _create_bq_tables_for_prj(prj, config):
+    """Create the audit dataset + metadata & audit tables in prj's BQ project space."""
+    bq_project = config[f"bq_prod_project_{prj}"]
+    conn_id    = config[f"GCP_CONN_DO_ID_{prj}"]
+    dataset    = config["Metadata_Dataset"]          # edw_data_migration_audit_tbls
+
+    hook   = BigQueryHook(gcp_conn_id=conn_id, use_legacy_sql=False)
+    client = hook.get_client(project_id=bq_project, location="US")
+
+    # Create dataset if it doesn't exist
+    from google.cloud.bigquery import Dataset as BQDataset
+    ds_obj = BQDataset(f"{bq_project}.{dataset}")
+    ds_obj.location = "US"
+    client.create_dataset(ds_obj, exists_ok=True)
+    print(f"  Dataset ready: {bq_project}.{dataset}")
+
+    # Create metadata table
+    meta_ddl = _METADATA_DDL.format(
+        project=bq_project, dataset=dataset, table=config["Metadata_Tbl"]
+    )
+    client.query(meta_ddl).result()
+    print(f"  Table ready: {bq_project}.{dataset}.{config['Metadata_Tbl']}")
+
+    # Create audit table
+    audit_ddl = _AUDIT_DDL.format(
+        project=bq_project, dataset=dataset, table=config["Audit_Table"]
+    )
+    client.query(audit_ddl).result()
+    print(f"  Table ready: {bq_project}.{dataset}.{config['Audit_Table']}")
+
+
+# ---------------------------------------------------------------------------
+# Tasks — single-project pipeline
+# ---------------------------------------------------------------------------
+
+def validate_prj_config(**kwargs):
+    prj = kwargs["dag_run"].conf.get("prj")
+    if not prj:
+        raise AirflowFailException("Missing required param: prj")
+
+    config  = _load_config()
+    missing = [
+        k.format(prj=prj)
+        for k in PRJ_REQUIRED_KEYS
+        if k.format(prj=prj) not in config
+    ]
+    if missing:
+        raise AirflowFailException(
+            f"Project '{prj}' is missing keys in history_load_config_wave_wb.json:\n  "
+            + "\n  ".join(missing)
+        )
+
+    print(f"Config validation passed for prj='{prj}':")
+    for k in PRJ_REQUIRED_KEYS:
+        full_key = k.format(prj=prj)
+        print(f"  {full_key}: {config[full_key]}")
+
+
+def create_bq_tables(**kwargs):
+    prj = kwargs["dag_run"].conf.get("prj")
+    if not prj:
+        raise AirflowFailException("Missing required param: prj")
+    config = _load_config()
+    print(f"Creating BQ audit/metadata tables for prj='{prj}' ...")
+    _create_bq_tables_for_prj(prj, config)
+    print(f"BQ table setup complete for prj='{prj}'")
+
+
+def cleanup_project_dags(**kwargs):
+    prj    = kwargs["dag_run"].conf.get("prj")
+    if not prj:
+        raise AirflowFailException("Missing required param: prj")
+
+    config          = _load_config()
+    dag_folder      = config[f"dag_folder_{DEPLOY_PROJECT}"]
+    conn_id         = config[f"GCP_CONN_DO_ID_{DEPLOY_PROJECT}"]
+    composer_bucket = config["composer_bucket"]
+
+    hook   = GCSHook(gcp_conn_id=conn_id)
+    prefix = f"{GCS_DAGS_PREFIX}/{dag_folder}/{OUTPUT_FOLDER}/"
+
+    objects = hook.list(bucket_name=composer_bucket, prefix=prefix) or []
+    deleted = 0
+    for obj in objects:
+        basename = obj.split("/")[-1]
+        if f"_{prj}_" in basename or basename.endswith(f"_{prj}.py") or f"_{prj}." in basename:
+            hook.delete(bucket_name=composer_bucket, object_name=obj)
+            print(f"Deleted: gs://{composer_bucket}/{obj}")
+            deleted += 1
+        else:
+            print(f"Skipped (different project): gs://{composer_bucket}/{obj}")
+
+    print(f"Cleanup done. Deleted {deleted} file(s) for prj='{prj}'")
+
+
+def generate_wb_dags(**kwargs):
+    prj    = kwargs["dag_run"].conf.get("prj")
+    if not prj:
+        raise AirflowFailException("Missing required param: prj")
+
+    config          = _load_config()
+    # All WB DAGs live in the zdwvdo folder — use its dag_folder and conn_id for all uploads
+    dag_folder      = config[f"dag_folder_{DEPLOY_PROJECT}"]
+    conn_id         = config[f"GCP_CONN_DO_ID_{DEPLOY_PROJECT}"]
+    composer_bucket = config["composer_bucket"]
+
+    hook = GCSHook(gcp_conn_id=conn_id)
+
+    # Generate one auto trigger DAG per priority level (li1=critical, li2=high, li3=medium, li4=low)
+    auto_tmpl = hook.download(
+        bucket_name=composer_bucket,
+        object_name=f"{TEMPLATE_GCS_PREFIX}/automatic_trigger_writeback_utility_template.txt"
+    ).decode("utf-8")
+
+    for load_instance, schedule in AUTO_TRIGGER_LEVELS.items():
+        content = _replace_project(auto_tmpl, prj)
+        content = content.replace("@load_instance", str(load_instance))
+        content = content.replace("@schedule", schedule)
+        dag_filename = f"dg_{prj}_bq2td_automatic_trigger_writeback_utility_li{load_instance}.py"
+        gcs_object   = f"{GCS_DAGS_PREFIX}/{dag_folder}/{OUTPUT_FOLDER}/{dag_filename}"
+        hook.upload(
+            bucket_name=composer_bucket,
+            object_name=gcs_object,
+            data=content.encode("utf-8"),
+            mime_type="text/x-python",
+        )
+        print(f"Uploaded: gs://{composer_bucket}/{gcs_object}")
+
+    # Generate remaining single-instance WB framework DAGs
+    for template_file, filename_pattern in TEMPLATES.items():
+        content = hook.download(
+            bucket_name=composer_bucket,
+            object_name=f"{TEMPLATE_GCS_PREFIX}/{template_file}"
+        ).decode("utf-8")
+
+        content      = _replace_project(content, prj)
+        dag_filename = filename_pattern.format(prj=prj)
+        gcs_object   = f"{GCS_DAGS_PREFIX}/{dag_folder}/{OUTPUT_FOLDER}/{dag_filename}"
+
+        hook.upload(
+            bucket_name=composer_bucket,
+            object_name=gcs_object,
+            data=content.encode("utf-8"),
+            mime_type="text/x-python",
+        )
+        print(f"Uploaded: gs://{composer_bucket}/{gcs_object}")
+
+    print(f"Generated {len(AUTO_TRIGGER_LEVELS) + len(TEMPLATES)} WB framework DAG(s) for prj='{prj}'")
+
+
+# ---------------------------------------------------------------------------
+# Refresh-ALL: regenerates WB framework DAGs for every project in config
+# ---------------------------------------------------------------------------
+
+def refresh_all_projects(**_):
+    config   = _load_config()
+    projects = _all_projects_in_config(config)
+
+    if not projects:
+        raise AirflowFailException("No projects with complete WB config found.")
+
+    print(f"Found {len(projects)} project(s) to refresh: {projects}")
+
+    succeeded, errors = [], []
+
+    for prj in projects:
+        print(f"\n{'='*60}")
+        print(f"[START] prj='{prj}'")
+        print(f"{'='*60}")
+        try:
+            # All WB DAGs live in zdwvdo folder — always use its dag_folder and conn_id
+            dag_folder      = config[f"dag_folder_{DEPLOY_PROJECT}"]
+            conn_id         = config[f"GCP_CONN_DO_ID_{DEPLOY_PROJECT}"]
+            composer_bucket = config["composer_bucket"]
+            hook            = GCSHook(gcp_conn_id=conn_id)
+
+            # Cleanup existing WB DAGs for this project from zdwvdo folder
+            prefix  = f"{GCS_DAGS_PREFIX}/{dag_folder}/{OUTPUT_FOLDER}/"
+            objects = hook.list(bucket_name=composer_bucket, prefix=prefix) or []
+            for obj in objects:
+                basename = obj.split("/")[-1]
+                if f"_{prj}_" in basename or basename.endswith(f"_{prj}.py") or f"_{prj}." in basename:
+                    hook.delete(bucket_name=composer_bucket, object_name=obj)
+                    print(f"  [CLEANUP] Deleted: gs://{composer_bucket}/{obj}")
+
+            # Create audit dataset + metadata & audit tables in this project's BQ space
+            print(f"  [BQ SETUP] Creating tables for prj='{prj}' ...")
+            _create_bq_tables_for_prj(prj, config)
+
+            # Generate one auto trigger DAG per priority level
+            auto_tmpl = hook.download(
+                bucket_name=composer_bucket,
+                object_name=f"{TEMPLATE_GCS_PREFIX}/automatic_trigger_writeback_utility_template.txt"
+            ).decode("utf-8")
+
+            for load_instance, schedule in AUTO_TRIGGER_LEVELS.items():
+                content = _replace_project(auto_tmpl, prj)
+                content = content.replace("@load_instance", str(load_instance))
+                content = content.replace("@schedule", schedule)
+                dag_filename = f"dg_{prj}_bq2td_automatic_trigger_writeback_utility_li{load_instance}.py"
+                gcs_object   = f"{GCS_DAGS_PREFIX}/{dag_folder}/{OUTPUT_FOLDER}/{dag_filename}"
+                hook.upload(
+                    bucket_name=composer_bucket,
+                    object_name=gcs_object,
+                    data=content.encode("utf-8"),
+                    mime_type="text/x-python",
+                )
+                print(f"  [UPLOAD] gs://{composer_bucket}/{gcs_object}")
+
+            # Generate and upload remaining single-instance WB framework DAGs
+            for template_file, filename_pattern in TEMPLATES.items():
+                content = hook.download(
+                    bucket_name=composer_bucket,
+                    object_name=f"{TEMPLATE_GCS_PREFIX}/{template_file}"
+                ).decode("utf-8")
+
+                content      = _replace_project(content, prj)
+                dag_filename = filename_pattern.format(prj=prj)
+                gcs_object   = f"{GCS_DAGS_PREFIX}/{dag_folder}/{OUTPUT_FOLDER}/{dag_filename}"
+
+                hook.upload(
+                    bucket_name=composer_bucket,
+                    object_name=gcs_object,
+                    data=content.encode("utf-8"),
+                    mime_type="text/x-python",
+                )
+                print(f"  [UPLOAD] gs://{composer_bucket}/{gcs_object}")
+
+            succeeded.append(prj)
+            print(f"[SUCCESS] prj='{prj}' refreshed successfully.")
+
+        except Exception as e:
+            errors.append(prj)
+            print(f"[FAILED]  prj='{prj}' | ERROR: {e}")
+
+    print(f"\n{'='*60}")
+    print(f"REFRESH COMPLETE — {len(projects)} project(s) processed")
+    print(f"  SUCCESS ({len(succeeded)}): {', '.join(succeeded) if succeeded else 'none'}")
+    print(f"  FAILED  ({len(errors)}):  {', '.join(errors)     if errors    else 'none'}")
+    print(f"{'='*60}")
+
+    if errors:
+        raise AirflowFailException(
+            f"{len(errors)} project(s) failed. "
+            f"Search logs for '[FAILED]' to see individual errors."
+        )
+
+
+def branch_on_refresh_all(**kwargs):
+    if kwargs["dag_run"].conf.get("refresh_all", False):
+        return "refresh_all_projects"
+    return "validate_prj_config"
+
+
+# ---------------------------------------------------------------------------
+# DAG definition — two modes:
+#   refresh_all=False (default)  → single-project pipeline
+#   refresh_all=True             → regenerate WB DAGs for all projects in config
+# ---------------------------------------------------------------------------
+
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "start_date": datetime(2026, 3, 9),
+    "retries": 0,
+}
+
+with DAG(
+    dag_id="WB_New_Project_Dag_Setup",
+    default_args=default_args,
+    description="Deploy WB framework DAGs for a single project, or refresh all projects at once.",
+    schedule_interval=None,
+    catchup=False,
+    params={
+        "prj": "zdwvdo",
+        "refresh_all": False,
+    },
+) as dag:
+
+    branch_task = BranchPythonOperator(
+        task_id="branch_refresh_or_single",
+        python_callable=branch_on_refresh_all,
+    )
+
+    refresh_all_task = PythonOperator(
+        task_id="refresh_all_projects",
+        python_callable=refresh_all_projects,
+    )
+
+    validate_config = PythonOperator(
+        task_id="validate_prj_config",
+        python_callable=validate_prj_config,
+    )
+
+    create_tables = PythonOperator(
+        task_id="create_bq_tables",
+        python_callable=create_bq_tables,
+    )
+
+    cleanup_dags = PythonOperator(
+        task_id="cleanup_project_dags",
+        python_callable=cleanup_project_dags,
+    )
+
+    generate_dags = PythonOperator(
+        task_id="generate_wb_dags",
+        python_callable=generate_wb_dags,
+    )
+
+    # Branch 1: refresh all projects in one shot
+    branch_task >> refresh_all_task
+
+    # Branch 2: single-project pipeline
+    branch_task >> validate_config >> create_tables >> cleanup_dags >> generate_dags

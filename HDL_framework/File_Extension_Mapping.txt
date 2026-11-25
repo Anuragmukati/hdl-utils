@@ -1,0 +1,94 @@
+HDL Framework - File Extension Mapping
+======================================
+
+Every file in this package was given a .txt extension so it can be shared and opened as plain text.
+To use a file, rename it back to the original path shown after the '<-' arrow.
+Paths are relative to the package root. Two files had a suffix added to avoid a name clash (see Notes).
+The Word guide (.docx) was left unchanged because renaming it to .txt would make it unreadable.
+
+Summary: 61 files renamed, 14 files unchanged, 75 total (this mapping file excluded).
+
+Count by original extension:
+  .json  2
+  .md    1
+  .py    37
+  .sh    5
+  .sql   16
+
+Mapping (New path  <-  Original path)
+--------------------------------------
+ADHOC\history_load_dag_edw_stg__dnb__daily_Fullload.txt	<-	ADHOC\history_load_dag_edw_stg__dnb__daily_Fullload.py
+ADHOC\history_load_dag_nos_parquet_adhoc_gk1vbizdo_PLE.txt	<-	ADHOC\history_load_dag_nos_parquet_adhoc_gk1vbizdo_PLE.py
+Config\history_load_config_wave_hdl.txt	<-	Config\history_load_config_wave_hdl.json
+Config\history_load_config_wave_wb.txt	<-	Config\history_load_config_wave_wb.json
+DBC_TBLS\history_load_dag_nos_dbc_colsv.txt	<-	DBC_TBLS\history_load_dag_nos_dbc_colsv.py
+DBC_TBLS\history_load_dag_nos_dbc_colsv_hptv.txt	<-	DBC_TBLS\history_load_dag_nos_dbc_colsv_hptv.py
+DBC_TBLS\history_load_dag_nos_dbc_colsv_p2.txt	<-	DBC_TBLS\history_load_dag_nos_dbc_colsv_p2.py
+DBC_TBLS\history_load_dag_nos_dbc_colsv_zdwvdo.txt	<-	DBC_TBLS\history_load_dag_nos_dbc_colsv_zdwvdo.py
+DBC_TBLS\history_load_dag_nos_dbc_tablsv.txt	<-	DBC_TBLS\history_load_dag_nos_dbc_tablsv.py
+DBC_TBLS\history_load_dag_nos_dbc_tablsv_zdwvdo.txt	<-	DBC_TBLS\history_load_dag_nos_dbc_tablsv_zdwvdo.py
+DBC_TBLS\history_load_dag_nos_dbc_tble_size.txt	<-	DBC_TBLS\history_load_dag_nos_dbc_tble_size.py
+DBC_TBLS\history_load_dag_nos_dbc_tble_size_p2.txt	<-	DBC_TBLS\history_load_dag_nos_dbc_tble_size_p2.py
+DBC_TBLS\history_load_dag_nos_dbc_tble_size_zdwvdo.txt	<-	DBC_TBLS\history_load_dag_nos_dbc_tble_size_zdwvdo.py
+DBC_TBLS\history_load_dag_nos_pdcrdata_dbqlogtbl_hst.txt	<-	DBC_TBLS\history_load_dag_nos_pdcrdata_dbqlogtbl_hst.py
+DDL\edw_data_migration_audit_tbls_historical_load_audit_table.txt	<-	DDL\edw_data_migration_audit_tbls_historical_load_audit_table.sql
+DDL\edw_data_migration_audit_tbls_writeback_audit_table.txt	<-	DDL\edw_data_migration_audit_tbls_writeback_audit_table.sql
+DDL\edw_data_migration_audit_tbls_writeback_metadata_table.txt	<-	DDL\edw_data_migration_audit_tbls_writeback_metadata_table.sql
+DDL\edw_data_migration_ops_tbls.historical_load_event_based_metadata_table.txt	<-	DDL\edw_data_migration_ops_tbls.historical_load_event_based_metadata_table.sql
+DDL\edw_data_migration_ops_tbls.historical_load_temp_sync_metadata_table.txt	<-	DDL\edw_data_migration_ops_tbls.historical_load_temp_sync_metadata_table.sql
+DDL\edw_data_migration_ops_tbls_historical_load_metadata_table.txt	<-	DDL\edw_data_migration_ops_tbls_historical_load_metadata_table.sql
+DDL\edw_data_migration_ops_tbls_Nos_Queue_Table_Large.txt	<-	DDL\edw_data_migration_ops_tbls_Nos_Queue_Table_Large.sql
+DDL\edw_data_migration_ops_tbls_Nos_Queue_Table_Medium.txt	<-	DDL\edw_data_migration_ops_tbls_Nos_Queue_Table_Medium.sql
+DDL\edw_data_migration_ops_tbls_Nos_Queue_Table_Small.txt	<-	DDL\edw_data_migration_ops_tbls_Nos_Queue_Table_Small.sql
+DDL\edw_data_migration_ops_tbls_table_schedule_config.txt	<-	DDL\edw_data_migration_ops_tbls_table_schedule_config.sql
+DDL\SP_JOB_AUDIT_LOGGING.txt	<-	DDL\SP_JOB_AUDIT_LOGGING.sql
+DDL\SP_TGT_LOAD.txt	<-	DDL\SP_TGT_LOAD.sql
+DDL\SP_TGT_LOAD_APPEND.txt	<-	DDL\SP_TGT_LOAD_APPEND.sql
+HDL_Framework_New_Project_Setup_Guide.docx	<-	(no change)	UNCHANGED (Word binary; renaming would corrupt it)
+HDL_Framework_New_Project_Setup_Guide.txt	<-	HDL_Framework_New_Project_Setup_Guide.md
+HDL_Runbook_Waves.txt	<-	(no change)	UNCHANGED (already .txt)
+Plugins\multi_cron_timetable.txt	<-	Plugins\multi_cron_timetable.py
+POD\history_load_dag_pod_ple.txt	<-	POD\history_load_dag_pod_ple.py
+POD\history_load_dag_pod_pp.txt	<-	POD\history_load_dag_pod_pp.py
+rough\history_load_dag__ast__marketo_lead_base_event_Fullload.txt	<-	rough\history_load_dag__ast__marketo_lead_base_event_Fullload.py
+rough\history_load_dag__bods_stg__nasp_hier_daily_Fullload.txt	<-	rough\history_load_dag__bods_stg__nasp_hier_daily_Fullload.py
+SQL\PROC_SCD_DATA_LOAD_FRAMEWORK.txt	<-	SQL\PROC_SCD_DATA_LOAD_FRAMEWORK.sql
+SQL\PROC_SCD_DATA_LOAD_FRAMEWORK2.txt	<-	SQL\PROC_SCD_DATA_LOAD_FRAMEWORK2.sql
+SQL\SP_JOB_AUDIT_LOGGING.txt	<-	SQL\SP_JOB_AUDIT_LOGGING.sql
+Template\HDL\adhoc_csv_template.txt	<-	(no change)	UNCHANGED (already .txt)
+Template\HDL\adhoc_parquet_template.txt	<-	(no change)	UNCHANGED (already .txt)
+Template\HDL\dag_creator_temp_sync.txt	<-	Template\HDL\dag_creator_temp_sync.py
+Template\HDL\dag_regenerator_temp_sync.txt	<-	Template\HDL\dag_regenerator_temp_sync.py
+Template\HDL\Fullload_hashchunk_template.txt	<-	(no change)	UNCHANGED (already .txt)
+Template\HDL\Fullload_template.txt	<-	(no change)	UNCHANGED (already .txt)
+Template\HDL\history_dag_load_event_based_automatic_trigger.txt	<-	Template\HDL\history_dag_load_event_based_automatic_trigger.py
+Template\HDL\history_dag_td2bq_event_based_automatic_trigger.txt	<-	Template\HDL\history_dag_td2bq_event_based_automatic_trigger.py
+Template\HDL\incremental_template.txt	<-	(no change)	UNCHANGED (already .txt)
+Template\HDL\nos_csv_template.txt	<-	(no change)	UNCHANGED (already .txt)
+Template\HDL\nos_parquet_template.txt	<-	(no change)	UNCHANGED (already .txt)
+Template\HDL\teradata_query_executor_nos_ids.txt	<-	Template\HDL\teradata_query_executor_nos_ids.py
+Template\WB\automatic_trigger_writeback_utility_template.txt	<-	(no change)	UNCHANGED (already .txt)
+Template\WB\manual_trigger_writeback_utility_template.txt	<-	(no change)	UNCHANGED (already .txt)
+Template\WB\scheduled_dag_audit_template.txt	<-	(no change)	UNCHANGED (already .txt)
+Template\WB\writeback_dag_generation_utility_template.txt	<-	(no change)	UNCHANGED (already .txt)
+Template\WB\writeback_dag_template.txt	<-	(no change)	UNCHANGED (already .txt)
+utility\dag_non_collated_view_identification_alert.txt	<-	utility\dag_non_collated_view_identification_alert.py
+utility\dag_table_count_td_bq_all.txt	<-	utility\dag_table_count_td_bq_all.py
+utility\delete_data_based_of_where_condition.txt	<-	utility\delete_data_based_of_where_condition.py
+utility\delete_metadata.txt	<-	utility\delete_metadata.sh
+utility\dg_sql_run.txt	<-	utility\dg_sql_run.py
+utility\find_ddl.txt	<-	utility\find_ddl.py
+utility\find_set_multiset_type_of_td_table_from_ddl.txt	<-	utility\find_set_multiset_type_of_td_table_from_ddl.py
+utility\get_min_max_dag.txt	<-	utility\get_min_max_dag.py
+utility\get_table_size.txt	<-	utility\get_table_size.sh
+utility\hdl_metadata_creation_dag.txt	<-	utility\hdl_metadata_creation_dag.py
+utility\hdl_metadata_creation_dag_for_all_UGs.txt	<-	utility\hdl_metadata_creation_dag_for_all_UGs.py
+utility\Historical_New_Project_Dag_Setup.txt	<-	utility\Historical_New_Project_Dag_Setup.py
+utility\history_load_dag_nos_csv_small_bgtsdo_PP1.txt	<-	utility\history_load_dag_nos_csv_small_bgtsdo_PP1.py
+utility\history_load_dag_prod_to_ple.txt	<-	utility\history_load_dag_prod_to_ple.py
+utility\history_load_dag_prod_to_ple_gk1v.txt	<-	utility\history_load_dag_prod_to_ple_gk1v.py
+utility\run_bq_ddl.txt	<-	utility\run_bq_ddl.sh
+utility\src_tgt_table_updatation_py.txt	<-	utility\src_tgt_table_updatation.py	Renamed; suffix added to avoid name clash with the other file of the same name
+utility\src_tgt_table_updatation_sh.txt	<-	utility\src_tgt_table_updatation.sh	Renamed; suffix added to avoid name clash with the other file of the same name
+utility\ug1_metadata_creation_non_incr.txt	<-	utility\ug1_metadata_creation_non_incr.sh
+utility\WB_New_Project_Dag_Setup.txt	<-	utility\WB_New_Project_Dag_Setup.py

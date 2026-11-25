@@ -1,0 +1,140 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from google.cloud.exceptions import NotFound
+from datetime import datetime
+
+GCP_CONN_DO_ID     = "sa-PROJECT_ID_28"
+GCP_CONN_DO_ID_PLE = "sa-PROJECT_ID_28"
+bq_prod_project    = "PROJECT_ID_30"
+bq_ple_project     = "PROJECT_ID_31"
+
+
+def check_table_exists(BQ_Table_list):
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID_PLE, use_legacy_sql=False)
+    client = hook.get_client()
+    tbl_fl_nm = f'{bq_ple_project}.{BQ_Table_list}'
+    tbl_fl_nm_prd = f'{bq_prod_project}.{BQ_Table_list}'
+    prd_status = ''
+    ple_status = ''
+    try:
+        client.get_table(tbl_fl_nm)
+        print(f"Table is exists:{tbl_fl_nm}")
+        ple_status = 'True'
+    except NotFound:
+        print(f"Table is not exists:{tbl_fl_nm}")
+        ple_status = 'False'
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False)
+    client = hook.get_client()
+    try:
+        client.get_table(tbl_fl_nm_prd)
+        print(f"Table is exists:{tbl_fl_nm_prd}")
+        prd_status = 'True'
+    except NotFound:
+        print(f"Table is not exists:{tbl_fl_nm_prd}")
+        prd_status = 'False'
+
+    return ple_status, prd_status
+
+
+def check_ddl_match(BQ_Table_list):
+    prd_client = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False).get_client()
+    ple_client = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID_PLE, use_legacy_sql=False).get_client()
+
+    prd_schema = prd_client.get_table(f'{bq_prod_project}.{BQ_Table_list}').schema
+    ple_schema = ple_client.get_table(f'{bq_ple_project}.{BQ_Table_list}').schema
+
+    def schema_to_list(schema):
+        return [(f.name.lower(), f.field_type.upper(), f.mode.upper()) for f in schema]
+
+    prd_fields = schema_to_list(prd_schema)
+    ple_fields = schema_to_list(ple_schema)
+
+    if prd_fields == ple_fields:
+        print("DDL check passed: PROD and PLE schemas match.")
+        return True
+
+    prd_set = set(prd_fields)
+    ple_set = set(ple_fields)
+    only_in_prd = prd_set - ple_set
+    only_in_ple = ple_set - prd_set
+    print("#######################################")
+    print("DDL MISMATCH between PROD and PLE!")
+    if only_in_prd:
+        print(f"Columns/types in PROD but not in PLE: {sorted(only_in_prd)}")
+    if only_in_ple:
+        print(f"Columns/types in PLE but not in PROD: {sorted(only_in_ple)}")
+    print("#######################################")
+    return False
+
+
+def prod_to_ple(**kwargs):
+    Table_Name_list = kwargs['dag_run'].conf.get('Table_Name', [])
+
+    if isinstance(Table_Name_list, str):
+        Table_Name_list = [Table_Name_list]
+
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+
+    for Table_Name in Table_Name_list:
+        print(f"Processing table: {Table_Name}")
+        ple, prd = check_table_exists(Table_Name)
+
+        if ple == 'True' and prd == 'True':
+            ddl_match = check_ddl_match(Table_Name)
+            if not ddl_match:
+                print(f"Skipping {Table_Name} due to DDL mismatch. Please align the schemas before copying.")
+                continue
+            sql = f"BEGIN TRANSACTION; TRUNCATE TABLE {bq_ple_project}.{Table_Name}; INSERT INTO {bq_ple_project}.{Table_Name} SELECT * FROM {bq_prod_project}.{Table_Name}; COMMIT TRANSACTION;"
+            try:
+                print(sql)
+                cursor.execute(sql)
+                print(f"Successfully copied {Table_Name} from PROD to PLE.")
+            except Exception as e:
+                print(f'Error occured: {e}')
+                print(f'PROD to PLE got failed for table: {Table_Name}')
+                raise
+        else:
+            if ple != 'True' and prd != 'True':
+                print("#######################################")
+                print("Table not created in PLE and Prod Both", Table_Name)
+                print("#######################################")
+            elif ple != 'True':
+                print("#######################################")
+                print("Table not created in ple", Table_Name)
+                print("#######################################")
+            elif prd != 'True':
+                print("#######################################")
+                print("Table not created in prod", Table_Name)
+                print("#######################################")
+
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 4, 9),
+    'retries': 0
+}
+
+dag = DAG(
+    dag_id='history_load_dag_prod_to_ple_gk1v',
+    default_args=default_args,
+    description='DAG to copy BQ tables from gk1v PROD to PLE',
+    schedule_interval=None,
+    max_active_runs=5,
+    catchup=False,
+    params={
+        "Table_Name": ["db.table1", "db.table2"]
+    }
+)
+
+bq_prod_to_bq_ple_load = PythonOperator(
+    task_id='bq_prod_to_bq_ple_load',
+    python_callable=prod_to_ple,
+    provide_context=True,
+    dag=dag
+)
+
+bq_prod_to_bq_ple_load

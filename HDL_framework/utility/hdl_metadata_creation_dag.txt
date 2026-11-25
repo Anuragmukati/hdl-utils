@@ -1,0 +1,136 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowFailException
+from airflow.providers.google.cloud.operators.bigquery import BigQueryHook
+
+import json
+from datetime import datetime
+from datetime import datetime
+import sys
+import random
+import time
+import pendulum
+
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_130/"
+sys.path.append(f"{BASE_DIR}/")
+
+local_tz = pendulum.timezone("America/New_York")
+def read_config():
+    with open('/home/airflow/gcs/dags/PROJECT_ID_130/history_load_config_prod_hdl.json', 'r') as f:
+        confid_details = json.load(f)
+    return confid_details
+
+
+config = read_config()
+
+
+Metadata_db=config["Metadata_Dataset"]
+Metadata_tbl=config["Metadata_Tbl"]
+HDL_project=config["hdl_source_project"]
+hdl_source_connection_id=config["hdl_source_connection_id"]
+
+
+time.sleep(random.randint(1,18))
+
+
+def create_metadata(**kwargs):
+
+    Table_list=kwargs['dag_run'].conf.get('Table_list','')
+    App_Name=kwargs['dag_run'].conf.get('App_Name','')
+    Force_Full_Sync=kwargs['dag_run'].conf.get('Force_Full_Sync','False')
+    if not Table_list:
+        print("Please provide Table List")
+        raise AirflowFailException("Please provide Table List")
+    if not App_Name:
+        print("Please provide App_Name")
+        raise AirflowFailException("Please provide App_Name")
+    hook = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    app_name_to_prd_proj = {
+        "Adcpdo": "PROJECT_ID_102",
+        "Zdwvdo": "PROJECT_ID_02",
+        "Zdwvdo_PP_Full": "PROJECT_ID_02",
+        "Zdwvdo_PP_Full_Daily": "PROJECT_ID_02",
+        "Enabdo": "PROJECT_ID_96",
+        "Enabdo_PP_Full": "PROJECT_ID_96",
+        "Enabdo_p2": "PROJECT_ID_96",
+        "Pblsdo": "PROJECT_ID_92",
+        "Msgcdo": "PROJECT_ID_90",
+        "Msgcdo_p2": "PROJECT_ID_90",
+        "Vzendo": "PROJECT_ID_94",
+        "Fpardo": "PROJECT_ID_131",
+        "Fpardo_PP_Full": "PROJECT_ID_131",
+        "Fpardo_PP_Full_Daily": "PROJECT_ID_131",
+        "NOS_First": "PROJECT_ID_30",
+        "OneEx": "PROJECT_ID_30",
+        "Cmhbdo": "PROJECT_ID_98",
+        "Bizdo": "PROJECT_ID_24",
+        "Bizdo_PP_Full": "PROJECT_ID_24",
+        "Bizdo_PP_Full_Daily": "PROJECT_ID_24",
+        "BizOps": "PROJECT_ID_24",
+        "Oneexp2": "PROJECT_ID_30",
+        "Gk1vdo": "PROJECT_ID_30",
+        "Gk1vdo_p2": "PROJECT_ID_30",
+        "Gk1vdo_PP_Hist": "PROJECT_ID_30",
+        "Gk1vdo_PP_Full": "PROJECT_ID_30",
+        "Gk1vdo_PP_Incr": "PROJECT_ID_30",
+        "Gk1vdo_PP_Full_Daily": "PROJECT_ID_30",
+        "Zdwvdo_PP_Full_Daily": "PROJECT_ID_02",
+    }
+
+    prd_proj = app_name_to_prd_proj.get(App_Name)
+
+    if not prd_proj:
+        print("Pass correct App Name and check with developer if it's a new app name")
+        raise AirflowFailException("Pass correct App Name and check with developer if it's a new app name")
+    if str(Force_Full_Sync).lower() == 'true':
+        delete_sql=f'DELETE FROM {HDL_project}.{Metadata_db}.{Metadata_tbl} WHERE lower(concat(src_schema,".",src_table)) in ({Table_list}) AND App_Name="{App_Name}"'
+        try:
+            cursor.execute(delete_sql)
+        except:
+            print("Delete Query Execution Failed")
+            raise AirflowFailException("Delete Query Execution Failed")
+    
+    metadata_creation_sql=f"insert into {HDL_project}.{Metadata_db}.{Metadata_tbl} (is_table_active,table_uid,src_schema,src_table,stg_schema,stg_table,tgt_schema,tgt_table,load_type,delta_column,delta_column_type,delta_column_format,delta_interval,app_name,src_table_size,src_table_row_count,src_table_type,bus_key_column,change_value_column,start_date_column,end_date_column,stg_load_enabled,plican_validation_enabled,select_query,load_functionality,select_query_tpt,spool_flag,bq_to_bq_query,stg_project_id,tgt_project_id)     WITH cte1 AS (     SELECT     c.databasename,     c.tablename,     c.columnName,     c.columntype,     c.Nullable,     c.columnlength,     t.total_size_GB,     row_number() OVER (PARTITION BY c.databasename, c.tablename ORDER BY c.columnid) columnid,      (     CASE     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'N' THEN     CONCAT(     'CASE WHEN RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\' \\'), CHR(13), \\' \\')) = \\'\\' ',     'THEN \\' \\' ELSE RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\' \\'), CHR(13), \\' \\')) ',     'END AS \"', TRIM(columnname), '\"'     )     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength <= 20 AND Nullable = 'N' THEN     CONCAT(     'CASE WHEN RTRIM(\"', TRIM(columnname), '\") = \\'\\' ',     'THEN \\' \\' ELSE RTRIM(\"', TRIM(columnname), '\") END AS \"', TRIM(columnname), '\"'     )     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'Y' THEN     CONCAT('RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\' \\'), CHR(13), \\' \\')) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND Nullable = 'Y' THEN     CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('D','F','N') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS DECIMAL(38,19)) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('I1') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS INTEGER) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('BF','BO') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS VARBYTE(10000)) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('DA','DT') THEN     CONCAT('TO_CHAR(\"', TRIM(columnname), '\", \\'YYYY-MM-DD\\') AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('AT') THEN     CONCAT('TO_CHAR(\"', TRIM(columnname), '\",\\'HH24:MI:SS.FF6\\') AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('TS','TZ') THEN     CONCAT(     'TO_CHAR(CASE WHEN \"', TRIM(columnname), '\" >= TIMESTAMP \\'9999-12-31 23:59:59\\' ',     'THEN TIMESTAMP \\'9999-12-31 23:59:59.000000\\' ELSE \"', TRIM(columnname),     '\" END, \\'YYYY-MM-DD HH24:MI:SS.FF6\\') AS \"', TRIM(columnname), '\"'     )     ELSE     CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')     END     ) AS NEW_COLUMN,      (     CASE     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'N' THEN     CONCAT(     'CASE WHEN RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\'\\' \\'\\'), CHR(13),\\'\\' \\'\\')) = \\'\\'\\'\\' ',     'THEN \\'\\' \\'\\' ELSE RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\'\\' \\'\\'), CHR(13), \\'\\' \\'\\')) ',     'END AS \"', TRIM(columnname), '\"'     )     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength <= 20 AND Nullable = 'N' THEN     CONCAT(     'CASE WHEN RTRIM(\"', TRIM(columnname), '\") = \\'\\'\\'\\' ',     'THEN \\'\\' \\'\\' ELSE RTRIM(\"', TRIM(columnname), '\") END AS \"', TRIM(columnname), '\"'     )     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'Y' THEN     CONCAT('RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\'\\' \\'\\'), CHR(13), \\'\\' \\'\\')) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND Nullable = 'Y' THEN     CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')     ELSE     CONCAT('\"', TRIM(columnname), '\"')     END     ) AS NEW_COLUMN_TPT,      (     CASE     WHEN columntype IN ('SC','JN','XM','UT','VA','CF','CV')  THEN     CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('BF','BO') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS VARBYTE(10000)) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('AT','TZ') THEN     CONCAT('CAST(CAST(\"', TRIM(columnname), '\" AS TIME(6) FORMAT \\'HH:MI:SS.s(6)\\') AS VARCHAR(16)) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('DA','DT') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS DATE FORMAT \\'YYYY-MM-DD\\') AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('TS','SZ') THEN     CONCAT(     'CAST(CAST(CASE WHEN \"', TRIM(columnname), '\" >= TIMESTAMP \\'9999-12-31 23:59:59\\' ',     'THEN TIMESTAMP \\'9999-12-31 23:59:59\\' ELSE \"', TRIM(columnname),     '\" END AS TIMESTAMP(6) FORMAT \\'YYYY-MM-DDBHH:MI:SS.S(6)\\') AS VARCHAR(26)) AS \"', TRIM(columnname), '\"'     )     WHEN columntype IN ('D','N','F') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS VARCHAR(100)) AS \"', TRIM(columnname), '\"')  WHEN columntype In ('CO') THEN CONCAT('CAST(\"', TRIM(columnname),'\" as VARCHAR(30000)) AS \"',TRIM(columnname),'\"')    ELSE     CONCAT('\"', TRIM(columnname), '\"')     END     ) AS NEW_COLUMN_BQ_TO_BQ      FROM     PROJECT_ID_31.{Metadata_db}.dbc_columnsv c LEFT JOIN PROJECT_ID_31.{Metadata_db}.dbc_tablesizev t     ON TRIM(LOWER(c.databasename)) = TRIM(LOWER(t.databasename))     AND TRIM(LOWER(c.tablename)) = TRIM(LOWER(t.tablename))     WHERE         LOWER(CONCAT(TRIM(c.databasename), '.', TRIM(c.tablename))) IN ({Table_list})     ),      cte2 AS (     SELECT     databasename,     tablename,     total_size_GB,     STRING_AGG(NEW_COLUMN ORDER BY columnid) AS selectcol,     STRING_AGG(NEW_COLUMN_TPT ORDER BY columnid) AS selectcol_tpt,     STRING_AGG(NEW_COLUMN_BQ_TO_BQ ORDER BY columnid) AS selectcol_bq     FROM     cte1     GROUP BY 1, 2, 3     )      SELECT     TRUE AS is_table_active,     CONCAT(TRIM(databasename), '__', TRIM(tablename)) AS table_uid,     case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end AS src_schema,     TRIM(tablename) AS src_table,     'edw_data_migration_opsstg_tbls' AS stg_schema,     CONCAT(LOWER(TRIM(databasename)), '__', LOWER(TRIM(tablename))) AS stg_table,     LOWER(TRIM(databasename)) AS tgt_schema,     LOWER(TRIM(tablename)) AS tgt_table,     'FullLoad' AS load_type,     '' AS delta_column,     '' AS delta_column_type,     '' AS delta_column_format,     0 AS delta_interval,     '{App_Name}' AS app_name,     CONCAT(CAST(total_size_GB AS STRING), 'GB') AS src_table_size,     0 AS src_table_row_count,     CASE     WHEN total_size_GB > 499 THEN 'Large'     WHEN total_size_GB > 100 THEN 'Medium'     ELSE 'Small'     END AS src_table_type,     '' AS bus_key_column,     '' AS change_value_column,     '' AS start_date_column,     '' AS end_date_column,     False AS stg_load_enabled,     False AS plican_validation_enabled,     CONCAT('select ', selectcol, ' from ', case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end, '.', TRIM(tablename)) AS select_query,     'NOS' AS load_functionality,     CONCAT('select ', selectcol_tpt, ' from ',case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end,'.',TRIM(tablename)) AS select_query_tpt,     0 AS SPOOL_FLAG,     CONCAT('select ', selectcol_bq, ' from ',case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end, '.', TRIM(tablename)) as bq_to_bq_query,     '{prd_proj}' AS stg_project_id,     '{prd_proj}' AS tgt_project_id     FROM     cte2 WHERE CONCAT(LOWER(case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end),LOWER(TRIM(tablename)),'{App_Name}')  NOT IN (Select CONCAT(LOWER(TRIM(src_schema)),LOWER(TRIM(src_table)),app_name) from  {HDL_project}.{Metadata_db}.{Metadata_tbl} );"
+    try:
+            cursor.execute(metadata_creation_sql)
+    except:
+            print("Metadata Creation Query Execution Failed")
+            raise AirflowFailException("Metadata Creation Query Execution Failed")
+
+    metadata_creation_sql_out=cursor.rowcount
+    print("number of affected rows:",metadata_creation_sql_out)
+
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 4, 9,tzinfo=local_tz),
+    'retries': 0
+}
+
+dag = DAG(
+    dag_id=f"hdl_metadata_creation_dag",
+    default_args=default_args,
+    description="DAG to insert metadata for historical load tables",
+    schedule_interval=None,
+    max_active_runs=5,
+    catchup=False,
+    params={
+        "Table_list": "'db.table1','db.table2'",
+        "App_Name": "Gk1vdo_PP_Full",
+        "Force_Full_Sync":"False"
+    },
+
+)
+    
+
+create_metadata_task=PythonOperator(
+    task_id='create_metadata_task',
+    python_callable=create_metadata,
+    dag=dag,
+    provide_context=True
+)
+
+create_metadata_task

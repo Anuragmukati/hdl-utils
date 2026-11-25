@@ -1,0 +1,179 @@
+from airflow import DAG
+import sys
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowFailException
+from airflow.providers.teradata.operators.teradata import TeradataOperator
+from datetime import datetime
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator,BigQueryHook
+from airflow.decorators import task 
+import json
+from datetime import datetime
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_130/"
+sys.path.append(f"{BASE_DIR}/")
+
+
+def read_config():
+    with open('/home/airflow/gcs/dags/PROJECT_ID_130/history_load_config_prod_hdl.json', 'r') as f:
+        confid_details = json.load(f)
+    return confid_details
+
+
+config = read_config()
+
+# gcs details
+GCP_CONN_ID = config["GCP_CONN_ID"]
+GCP_CONN_DO_ID = config["GCP_CONN_DO_ID_PLE_gk1vdo"]
+GCS_BUCKET = config["GCS_BUCKET"]
+GCS_PREFIX = config["GCS_PREFIX"]
+Metadata_tbl=config["Metadata_Table"]
+Metadata_db=config["Metadata_Dataset"]
+bq_target_project=config["bq_ple_project_gk1vdo"]
+
+
+
+
+
+def updt_sql_success(**kwargs):
+    ti=kwargs['ti']
+    db_nm=ti.xcom_pull(task_ids='fetch_metadata', key='db_nm')
+    tbl_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tbl_nm') 
+    cur_time=datetime.now()
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False)
+    sql='update '+str(bq_target_project)+'.'+str(Metadata_db)+'.'+str(Metadata_tbl)+' set STATUS="SUCCESSFUL",END_TIMESTAMP="'+str(cur_time)+'" where TABLE_NAME="'+str(tbl_nm)+'" and DATASET_NAME="'+str(db_nm)+'"'
+    print(sql)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql)
+    except:
+        print("update stmt failed")
+    
+def updt_sql(status,db_nm,tbl_nm):
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID, use_legacy_sql=False)
+    cur_time=datetime.now()
+    if status=='INPROGRESS':
+        sql='update '+str(bq_target_project)+'.'+str(Metadata_db)+'.'+str(Metadata_tbl)+' set STATUS="'+str(status)+'",START_TIMESTAMP="'+str(cur_time)+'" where TABLE_NAME="'+str(tbl_nm)+'" and DATASET_NAME="'+str(db_nm)+'"'
+    else:
+        sql='update '+str(bq_target_project)+'.'+str(Metadata_db)+'.'+str(Metadata_tbl)+' set STATUS="'+str(status)+'",END_TIMESTAMP="'+str(cur_time)+'" where TABLE_NAME="'+str(tbl_nm)+'" and DATASET_NAME="'+str(db_nm)+'"'
+    print(sql)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql)
+    except:
+        print("update stmt failed")
+
+def fetch_metadata(**kwargs):
+    fetch_query="select DataBaseName,TableName,Sum(CurrentPerm)/(1024*1024*1024) as total_size_GB   from dbc.tablesizev group by 1,2"
+    db_nm="edw_data_migration_ops_tbls"
+    tbl_nm="dbc_tablesizev"
+    
+    
+    
+    ti = kwargs['ti']
+    ti.xcom_push(key='fetch_query', value=fetch_query)
+    ti.xcom_push(key='tbl_nm',value=tbl_nm)
+    ti.xcom_push(key='db_nm',value=db_nm)
+
+def generate_nos_query(**kwargs):
+    ti = kwargs['ti']
+    db_nm=ti.xcom_pull(task_ids='fetch_metadata', key='db_nm') 
+    tbl_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tbl_nm')
+    fetch_query=ti.xcom_pull(task_ids='fetch_metadata', key='fetch_query') 
+    bucket = "BUCKET_NAME_02"
+    dt=kwargs['execution_date'].strftime('%Y%m%dT%H%M%S')
+    gcs_path = "nos/input/"+str(db_nm)+'_'+str(tbl_nm)+'/'+str(dt)
+    #bucket = "BUCKET_NAME_02"
+    #gcs_path = "nos/"+str(db_nm)+'_'+str(tbl_nm)
+    sql_query = f"""
+    SELECT * FROM WRITE_NOS (
+        ON ( {fetch_query} )
+        USING
+        LOCATION('/gs/storage.googleapis.com/{bucket}/{gcs_path}/')
+        AUTHORIZATION(<Teradata NOS authorization object with write access to the project GCS bucket>)
+        STOREDAS('parquet')
+        MAXOBJECTSIZE('16MB')
+        COMPRESSION('SNAPPY')
+    ) AS d;
+    """
+
+    ti.xcom_push(key='nos_query', value=sql_query)
+    ti.xcom_push(key='gcs_path',value=gcs_path)
+    ti.xcom_push(key='gcs_bucket',value=bucket)
+    
+
+    print("Generated Query:", sql_query)
+    #updt_sql('INPROGRESS',db_nm,tbl_nm)
+
+def fail_task(context):
+    ti=context['ti']
+    db_nm=ti.xcom_pull(task_ids='fetch_metadata', key='db_nm')
+    tbl_nm=ti.xcom_pull(task_ids='fetch_metadata', key='tbl_nm')
+    #updt_sql('DAG_FAILED',db_nm,tbl_nm)
+    raise AirflowFailException("DAG execution failed!")
+
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 5, 30),
+    'retries': 0
+}
+
+dag = DAG(
+    dag_id='history_load_dag_nos_dbc_tble_size',
+    default_args=default_args,
+    description='DAG to generate NOS SQL query for Teradata',
+    schedule_interval='00 12 * * *',
+    max_active_runs=1,
+    catchup=False
+)
+
+
+
+
+    
+get_metadata = PythonOperator(
+    task_id='fetch_metadata',
+    python_callable=fetch_metadata,
+    provide_context=True,  # Ensures kwargs include `dag_run`
+    dag=dag,
+    on_failure_callback=fail_task
+)   
+
+
+generate_query_task = PythonOperator(
+    task_id='generate_nos_query',
+    python_callable=generate_nos_query,
+    provide_context=True,  # Ensures kwargs include `dag_run`
+    dag=dag,
+    on_failure_callback=fail_task
+)
+
+nos_to_gcs_load = TeradataOperator(
+    task_id='nos_to_gcs_load',
+    conn_id="FUNCTION_ID_1",
+    sql="{{ ti.xcom_pull(task_ids='generate_nos_query', key='nos_query') }}",
+    retries=0,
+    dag=dag,
+    on_failure_callback=fail_task
+)
+
+gcs_to_bq_load = GCSToBigQueryOperator(
+    task_id="gcs_to_bq_load",
+    dag=dag,
+    bucket="BUCKET_NAME_02",
+    write_disposition="WRITE_TRUNCATE",
+    source_format="PARQUET",
+    allow_jagged_rows=True,
+    allow_quoted_newlines=True,
+    quote_character="\"",
+    gcp_conn_id=GCP_CONN_DO_ID,
+    source_objects=["{{ti.xcom_pull(task_ids='generate_nos_query', key='gcs_path') +'/*.parquet'}}"],
+    destination_project_dataset_table="{{params.bq_project}}.{{ ti.xcom_pull(task_ids='fetch_metadata', key='db_nm') }}.{{ ti.xcom_pull(task_ids='fetch_metadata', key='tbl_nm') }}",
+    on_failure_callback=fail_task,
+    params={'bq_project':bq_target_project}
+)
+
+get_metadata >> generate_query_task >> nos_to_gcs_load >> gcs_to_bq_load 

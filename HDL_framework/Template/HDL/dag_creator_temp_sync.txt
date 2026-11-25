@@ -1,0 +1,952 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowFailException, AirflowSkipException
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.utils.email import send_email
+from datetime import datetime
+import ast
+import json
+import re
+
+SOURCE_DIR  = "/home/airflow/gcs/dags/PROJECT_ID_25"
+CONFIG_PATH = f"{SOURCE_DIR}/history_load_config_wave_hdl.json"
+
+def _read_config():
+    with open(CONFIG_PATH, "r") as f:
+        return json.load(f)
+
+config = _read_config()
+
+HDL_CONN          = config["hdl_source_connection_id"]
+HDL_PROJECT       = config["hdl_source_project"]
+METADATA_DATASET  = config["Metadata_Dataset"]
+SYNC_METADATA_TBL = config["Sync_Metadata_Tbl"]
+TABLE_SIZE_TBL    = config["large_table_size"]
+COMPOSER_BUCKET   = config["Composer_Bucket"]
+GCS_DAGS_PREFIX   = "dags"
+
+SYNC_METADATA_TABLE    = f"{HDL_PROJECT}.{METADATA_DATASET}.{SYNC_METADATA_TBL}"
+TABLE_SIZE_TABLE       = f"{HDL_PROJECT}.{METADATA_DATASET}.{TABLE_SIZE_TBL}"
+EVENT_METADATA_DATASET = config["Event_Metadata_Dataset"]
+EVENT_METADATA_TBL     = config["Event_Metadata_Tbl"]
+EVENT_METADATA_TABLE   = f"{HDL_PROJECT}.{EVENT_METADATA_DATASET}.{EVENT_METADATA_TBL}"
+FULLLOAD_MAX_SIZE_GB   = config["large_table_size"]
+
+VALID_LOAD_TYPES = ["Fullload", "Fullload_HashChunk", "Incr_Append_Delete", "Incr_Append"]
+
+LOAD_TYPE_FOLDER = {
+    "Fullload":           "Fullload",
+    "Fullload_HashChunk": "Fullload",
+    "Incr_Append_Delete": "Incremental",
+    "Incr_Append":        "Incremental",
+}
+
+LOAD_TYPE_TEMPLATE = {
+    "Fullload":           "Fullload_template.txt",
+    "Fullload_HashChunk": "Fullload_hashchunk_template.txt",
+    "Incr_Append_Delete": "incremental_template.txt",
+    "Incr_Append":        "incremental_template.txt",
+}
+
+VALID_LOBS = ["VCG", "BODS", "VBG"]
+
+# Expected BQ project per LOB — table project must match
+LOB_BQ_PROJECT = {
+    "VCG":  "PROJECT_ID_24",
+    "BODS": "PROJECT_ID_24",
+    "VBG":  "PROJECT_ID_23",
+}
+
+# LOB + load_type → derived app_name
+LOB_APP_NAME = {
+    ("VCG",  True):  "Gk1vbizdo_PP_Full_Daily",
+    ("VCG",  False): "Gk1vbizdo_PP_Incr_Daily",
+    ("BODS", True):  "Gk1vbizdo_PP_Full_Daily",
+    ("BODS", False): "Gk1vbizdo_PP_Incr_Daily",
+    ("VBG",  True):  "Zdwvbizdo_PP_Full_Daily",
+    ("VBG",  False): "Zdwvbizdo_PP_Incr_Daily",
+}
+
+# replication_type controls how the generated DAG is triggered.
+# time-driven : scheduled by cron — schedule_interval required (fully supported)
+# event-driven: triggered by a parent/sensor DAG — schedule_interval not needed (fully supported)
+# tls-driven  : waits for Teradata Table Load Status before copying (template pending)
+VALID_REPLICATION_TYPES     = ["time-driven", "event-driven", "tls-driven"]
+SUPPORTED_REPLICATION_TYPES = ["time-driven", "event-driven"]
+
+# Supported TD control tables for event-driven replication.
+# Any other value must be onboarded by the HDL Owner before use.
+VALID_CONTROL_TABLES = [
+    "AST.MARKETO_JOB_STATUS",
+    "SOURCE_SCHEMA_03.MARKETO_PRCS_CTRL",
+    "BODS_METADATA_VW.PRCS_CTRL",
+    "EDW_METADATA_VW.PRCS_CTRL",
+]
+
+# NOTE: SYNC_METADATA_TABLE must have a dag_filename column (VARCHAR/STRING).
+#       Add it if missing: ALTER TABLE ... ADD COLUMN dag_filename STRING;
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _get_app_name(lob: str, load_type: str) -> str:
+    lob_upper = lob.upper().strip()
+    is_full   = load_type.strip().upper() in ("FULLLOAD", "FULLLOAD_HASHCHUNK")
+    app_name  = LOB_APP_NAME.get((lob_upper, is_full))
+    if app_name is None:
+        raise ValueError(f"Invalid LOB: '{lob}'. Valid values: {', '.join(VALID_LOBS)}")
+    return app_name
+
+
+def _params(**kwargs):
+    return kwargs["dag_run"].conf
+
+
+def _safe_job_id(job_id: str, max_len: int = 30) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_\-]", "_", str(job_id))
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return slug[:max_len]
+
+
+def _parse_tables(params):
+    """Airflow can deserialize nested list items as JSON strings — ensure each table is a dict."""
+    raw = params.get("tables", [])
+    result = []
+    for t in raw:
+        if isinstance(t, str):
+            try:
+                result.append(json.loads(t))
+            except json.JSONDecodeError:
+                result.append(ast.literal_eval(t))
+        else:
+            result.append(t)
+    return result
+
+
+def _tbl_label(tbl: dict) -> str:
+    return tbl.get("bq_table_full_name", "unknown_table")
+
+
+def _entry(tbl: dict, **extra) -> dict:
+    """Standardized result entry carrying all fields needed for the summary email."""
+    return {
+        "table":            tbl.get("bq_table_full_name", "unknown"),
+        "td_table":         tbl.get("td_table_full_name", "N/A"),
+        "load_type":        str(tbl.get("load_type", "N/A")),
+        "replication_type": str(tbl.get("replication_type", "N/A")),
+        **extra,
+    }
+
+
+# ── Task 1 — validate_params ───────────────────────────────────────────────────
+def validate_params(**kwargs):
+    params = _params(**kwargs)
+    ti     = kwargs["ti"]
+    tables = _parse_tables(params)
+
+    if not tables:
+        raise AirflowFailException("'tables' must be a non-empty list.")
+
+    valid_tables  = []
+    failed_tables = []
+
+    bq_hook = BigQueryHook(gcp_conn_id=HDL_CONN, use_legacy_sql=False)
+    conn   = bq_hook.get_conn()
+    cursor = conn.cursor()
+
+    for idx, tbl in enumerate(tables):
+        label  = _tbl_label(tbl)
+        errors = []
+
+        # ── replication_type (default: time-driven) ──────────────────────────
+        rep_type = str(tbl.get("replication_type") or "time-driven").strip().lower()
+        tbl["replication_type"] = rep_type
+
+        if rep_type not in VALID_REPLICATION_TYPES:
+            errors.append(
+                f"Invalid replication type: '{rep_type}'. "
+                f"Valid: {', '.join(VALID_REPLICATION_TYPES)}"
+            )
+
+        # ── required fields ──────────────────────────────────────────────────
+        always_required = [
+            "bq_table_full_name", "td_table_full_name", "load_type",
+            "LOB", "job_ref", "user_group", "requested_by",
+        ]
+        for field in always_required:
+            if not str(tbl.get(field, "")).strip():
+                errors.append(f"Parameter value missing: '{field}'")
+
+        if rep_type not in ("event-driven",):
+            if not str(tbl.get("schedule_interval", "")).strip():
+                errors.append(
+                    "Parameter value missing: 'schedule_interval' "
+                    "(required for time-driven / tls-driven)"
+                )
+
+        # ── event-driven extra fields ─────────────────────────────────────────
+        if rep_type == "event-driven":
+            for field in ["process_name", "control_table_name"]:
+                if not str(tbl.get(field, "")).strip():
+                    errors.append(f"Parameter value missing: '{field}' (required for event-driven)")
+
+            ctrl_tbl = str(tbl.get("control_table_name", "")).strip()
+            if ctrl_tbl and ctrl_tbl.upper() not in [c.upper() for c in VALID_CONTROL_TABLES]:
+                errors.append(
+                    f"Control table '{ctrl_tbl}' is not supported. "
+                    f"Contact HDL Owner for onboarding this control table. "
+                    f"Supported: {', '.join(VALID_CONTROL_TABLES)}"
+                )
+
+        # ── load_type ────────────────────────────────────────────────────────
+        load_type = str(tbl.get("load_type", "")).strip()
+        if load_type and load_type not in VALID_LOAD_TYPES:
+            errors.append(
+                f"Invalid load type: '{load_type}'. "
+                f"Allowed: {', '.join(VALID_LOAD_TYPES)}"
+            )
+
+        # ── Fullload_HashChunk extra fields ───────────────────────────────────
+        if load_type == "Fullload_HashChunk":
+            hash_column = str(tbl.get("hash_column", "")).strip()
+            if not hash_column:
+                errors.append("Parameter value missing: 'hash_column' (required for Fullload_HashChunk)")
+
+            total_hash_chunks = tbl.get("total_hash_chunks")
+            if total_hash_chunks is None or str(total_hash_chunks).strip() == "":
+                errors.append("Parameter value missing: 'total_hash_chunks' (required for Fullload_HashChunk)")
+            else:
+                try:
+                    chunks_int = int(total_hash_chunks)
+                    if chunks_int < 1:
+                        errors.append(f"'total_hash_chunks' must be a positive integer, got: {total_hash_chunks}")
+                except (ValueError, TypeError):
+                    errors.append(f"'total_hash_chunks' must be an integer, got: '{total_hash_chunks}'")
+
+        # ── LOB ──────────────────────────────────────────────────────────────
+        lob = str(tbl.get("LOB", "")).strip().upper()
+        if lob and lob not in VALID_LOBS:
+            errors.append(f"Invalid LOB: '{tbl.get('LOB')}'. Valid: {', '.join(VALID_LOBS)}")
+
+        # ── bq_table_full_name format ─────────────────────────────────────────
+        bq = str(tbl.get("bq_table_full_name", ""))
+        bq_format_ok = False
+        if bq:
+            if len(bq.split(".")) < 3:
+                errors.append(
+                    f"Invalid BQ table format: expected project.dataset.table, got: '{bq}'"
+                )
+            else:
+                bq_format_ok = True
+
+        # ── LOB / BQ project alignment check ────────────────────────────────
+        if bq_format_ok and lob and lob in LOB_BQ_PROJECT:
+            expected_project = LOB_BQ_PROJECT[lob]
+            actual_project   = bq.split(".")[0]
+            if actual_project != expected_project:
+                errors.append(
+                    f"BQ project mismatch: LOB '{lob}' requires project "
+                    f"'{expected_project}' but table project is '{actual_project}'"
+                )
+                bq_format_ok = False   # skip existence check for a mismatched project
+        
+        if load_type == 'Fullload':
+                parts = str(tbl.get("td_table_full_name")).split(".", 1)
+                tblnm=tbl.get('td_table_full_name')
+                if len(parts) == 2:
+                    size_sql = (
+                        f"SELECT LOWER(TRIM(databasename)), LOWER(TRIM(tablename)), "
+                        f"       COALESCE(SUM(total_size_GB), 0) AS size_gb "
+                        f"FROM `{TABLE_SIZE_TABLE}` "
+                        f"WHERE LOWER(CONCAT(TRIM(databasename), '.', TRIM(tablename))) = lower('{tblnm}') "
+                        f"GROUP BY 1, 2"
+                    )
+                    try:
+                        cursor.execute(size_sql)
+                        for row in cursor.fetchone():
+                            if float(row[2])>FULLLOAD_MAX_SIZE_GB:
+                                print("Table is greter than supported one. please set it up for Incremetnal load")
+                                errors.append(
+                                    f"Table size is greater than supported({FULLLOAD_MAX_SIZE_GB}). Please Set it up for Incremental Load"
+                                    f"'Table Name {tbl.get('td_table_full_name')} has size {row[2]}'"
+                                )
+                    except Exception as e:
+                        print(f"[WARN] Could not fetch table sizes from {TABLE_SIZE_TBL}: {e}. Proceeding without size check.")
+
+        # ── BQ table existence check ─────────────────────────────────────────
+        if bq_format_ok:
+            bq_parts = bq.split(".")
+            try:
+                exists = bq_hook.table_exists(
+                    project_id=bq_parts[0],
+                    dataset_id=bq_parts[1],
+                    table_id=bq_parts[2],
+                )
+                if not exists:
+                    errors.append(f"BQ table not found at location: '{bq}'")
+            except Exception as e:
+                print(f"[WARN] BQ existence check skipped for '{bq}': {e}")
+
+        # ── config key check ─────────────────────────────────────────────────
+        if not errors and load_type and lob:
+            try:
+                app_name = _get_app_name(lob, load_type)
+                prj_key  = app_name.split("_")[0].lower()
+                if f"dag_folder_{prj_key}" not in config:
+                    errors.append(
+                        f"LOB='{lob}' resolves to app_name='{app_name}' but "
+                        f"'dag_folder_{prj_key}' is missing from config"
+                    )
+            except ValueError as e:
+                errors.append(str(e))
+
+        if errors:
+            error_message = "; ".join(errors)
+            print(f"[INVALID] tables[{idx}] '{label}': {error_message}")
+            failed_tables.append(_entry(tbl, stage="validation", error_message=error_message))
+        else:
+            print(f"[VALID]   tables[{idx}] '{label}'")
+            valid_tables.append(tbl)
+
+    print(f"\nValidation complete — valid: {len(valid_tables)}, invalid: {len(failed_tables)}")
+
+    ti.xcom_push(key="valid_tables",  value=valid_tables)
+    ti.xcom_push(key="failed_tables", value=failed_tables)
+
+    if not valid_tables:
+        raise AirflowSkipException("All tables failed validation. Nothing to process.")
+
+
+# ── Task 2 — check_duplicate ───────────────────────────────────────────────────
+# Skipped = active entry already exists in metadata for same BQ table + TD table + load_type.
+# The existing dag_filename is fetched and stored so the email can show it.
+# NOTE: if dag_filename column is not yet in the metadata table, the fetch
+#       falls back gracefully to "N/A".
+def check_duplicate(**kwargs):
+    ti            = kwargs["ti"]
+    valid_tables  = ti.xcom_pull(task_ids="validate_params", key="valid_tables")  or []
+    failed_tables = ti.xcom_pull(task_ids="validate_params", key="failed_tables") or []
+
+    hook   = BigQueryHook(gcp_conn_id=HDL_CONN, use_legacy_sql=False)
+    conn   = hook.get_conn()
+    cursor = conn.cursor()
+
+    tables_to_process = []
+    skipped_tables    = []
+
+    for tbl in valid_tables:
+        label             = _tbl_label(tbl)
+        bq_table          = tbl["bq_table_full_name"]
+        td_table          = tbl["td_table_full_name"]
+        load_type         = tbl["load_type"]
+        schedule_interval = tbl.get("schedule_interval", "")
+
+        try:
+            _get_app_name(tbl["LOB"], load_type)   # validate mapping before hitting BQ
+        except ValueError as e:
+            failed_tables.append(_entry(tbl, stage="duplicate_check", error_message=str(e)))
+            continue
+
+        count_query = (
+            f"SELECT COUNT(*) AS cnt "
+            f"FROM `{SYNC_METADATA_TABLE}` "
+            f"WHERE bq_table_full_name = '{bq_table}' "
+            f"  AND td_table_full_name = '{td_table}' "
+            f"  AND load_type = '{load_type}' "
+            f"  AND is_active = TRUE"
+        )
+
+        try:
+            cursor.execute(count_query)
+            result = cursor.fetchone()
+            count  = result[0] if result else 0
+        except Exception as e:
+            failed_tables.append(
+                _entry(tbl, stage="duplicate_check", error_message=f"BQ query failed: {e}")
+            )
+            continue
+
+        if count > 0:
+            existing_dag = "N/A"
+            existing_rep = "unknown"
+            try:
+                dag_query = (
+                    f"SELECT dag_filename, replication_type "
+                    f"FROM `{SYNC_METADATA_TABLE}` "
+                    f"WHERE bq_table_full_name = '{bq_table}' "
+                    f"  AND td_table_full_name = '{td_table}' "
+                    f"  AND load_type = '{load_type}' "
+                    f"  AND is_active = TRUE "
+                    f"LIMIT 1"
+                )
+                cursor.execute(dag_query)
+                dag_row = cursor.fetchone()
+                if dag_row:
+                    if dag_row[0]:
+                        existing_dag = str(dag_row[0])
+                    if dag_row[1]:
+                        existing_rep = str(dag_row[1])
+            except Exception:
+                pass
+
+            skip_msg = (
+                f"Active DAG already exists as '{existing_rep}': {existing_dag}"
+            )
+            print(f"[SKIPPED] '{label}' — {skip_msg}")
+            skipped_tables.append({
+                **_entry(tbl, existing_dag=existing_dag, error_message=skip_msg),
+                # extra fields needed when inserting the duplicate record to metadata
+                "job_ref":           str(tbl.get("job_ref", "")).strip(),
+                "user_group":        str(tbl.get("user_group", "")).strip(),
+                "schedule_interval": schedule_interval,
+                "LOB":               str(tbl.get("LOB", "")).strip(),
+                "requested_by":      str(tbl.get("requested_by", "")).strip(),
+            })
+        else:
+            print(f"[OK] '{label}' — no duplicate found.")
+            tables_to_process.append(tbl)
+
+    print(
+        f"\nDuplicate check — to process: {len(tables_to_process)}, "
+        f"skipped: {len(skipped_tables)}, failed: {len(failed_tables)}"
+    )
+
+    ti.xcom_push(key="tables_to_process", value=tables_to_process)
+    ti.xcom_push(key="skipped_tables",    value=skipped_tables)
+    ti.xcom_push(key="failed_tables",     value=failed_tables)
+
+    if not tables_to_process:
+        raise AirflowSkipException("No tables left to process after duplicate check.")
+
+
+# ── Task 3 — generate_and_upload_dag ──────────────────────────────────────────
+def generate_and_upload_dag(**kwargs):
+    ti                = kwargs["ti"]
+    tables_to_process = ti.xcom_pull(task_ids="check_duplicate", key="tables_to_process") or []
+    failed_tables     = ti.xcom_pull(task_ids="check_duplicate", key="failed_tables") or []
+
+    deployed_tables = []
+
+    for tbl in tables_to_process:
+        label    = _tbl_label(tbl)
+        rep_type = tbl.get("replication_type", "time-driven")
+
+        if rep_type not in SUPPORTED_REPLICATION_TYPES:
+            msg = (
+                f"Replication type '{rep_type}' is valid but the DAG template "
+                f"is not yet available — entry queued as pending"
+            )
+            print(f"[FAILED] '{label}': {msg}")
+            failed_tables.append(_entry(tbl, stage="dag_generation", error_message=msg))
+            continue
+
+        try:
+            bq_table_full_name = tbl["bq_table_full_name"]
+            load_type          = tbl["load_type"]
+            job_ref            = str(tbl["job_ref"]).strip()
+            schedule_interval  = (
+                "None" if rep_type == "event-driven"
+                else str(tbl.get("schedule_interval") or "00 00 * * *").strip()
+            )
+            app_name           = _get_app_name(tbl["LOB"], load_type)
+
+            prj_key    = app_name.split("_")[0].lower()
+            dag_folder = config[f"dag_folder_{prj_key}"]
+            gcs_conn   = config[f"GCP_CONN_DO_ID_{prj_key}"]
+
+            prj = prj_key
+            rep = ""
+            if "_r2" in prj:
+                rep = "_R2"
+                prj = prj.replace("_r2", "")
+
+            parts                = bq_table_full_name.split(".")
+            db_nm                = parts[-2]
+            tbl_nm               = parts[-1]
+            table_name_formatted = f"{db_nm}__{tbl_nm}"
+            job_id_slug          = _safe_job_id(job_ref)
+            job_id_suffix        = f"_{job_id_slug}"
+            job_description      = f"Run daily sync for {table_name_formatted} - {job_ref}"
+
+            template_file = LOAD_TYPE_TEMPLATE[load_type]
+            template_path = f"{SOURCE_DIR}/Template/{template_file}"
+            with open(template_path, "r") as f:
+                content = f.read()
+
+            job_info_comment = (
+                f"# job_ref           : {job_ref}\n"
+                f"# job_description   : {job_description}\n"
+                f"# app_name          : {app_name}\n"
+                f"# LOB               : {tbl['LOB']}\n"
+                f"# replication_type  : {rep_type}\n"
+                f"# last_updated      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+
+            suffix        = "event" if rep_type == "event-driven" else "daily"
+
+            content = job_info_comment + content
+            content = content.replace("@Table_Name",        table_name_formatted)
+            content = content.replace("@tbl_uid",           table_name_formatted)
+            content = content.replace("@Table_type",        load_type)
+            content = content.replace("@dag_suffix",        suffix)
+            if rep_type == "event-driven":
+                # Strip the surrounding quotes so the output is  schedule_interval=None
+                # not  schedule_interval='None' / schedule_interval="None"
+                content = content.replace('"@schedule_interval"', 'None')
+                content = content.replace("'@schedule_interval'", 'None')
+                content = content.replace("@schedule_interval",   'None')
+            else:
+                content = content.replace("@schedule_interval", schedule_interval)
+            content = content.replace("@prj",               prj)
+            content = content.replace("@job_id",            job_id_suffix)
+            if load_type.lower() in ("fullload", "fullload_hashchunk"):
+                content = content.replace("@rep", rep)
+            if load_type == "Fullload_HashChunk":
+                hash_column       = str(tbl.get("hash_column", "")).strip()
+                total_hash_chunks = str(int(tbl.get("total_hash_chunks", 20)))
+                content = content.replace("'@hash_column'",     f"'{hash_column}'")
+                content = content.replace("@total_hash_chunks", total_hash_chunks)
+
+            dag_filename  = f"history_load_dag__{db_nm}__{tbl_nm}_{suffix}_{load_type}.py"
+            output_folder = LOAD_TYPE_FOLDER[load_type]
+            gcs_object    = f"{GCS_DAGS_PREFIX}/{dag_folder}/{output_folder}/{dag_filename}"
+
+            hook = GCSHook(gcp_conn_id=gcs_conn)
+            hook.upload(
+                bucket_name=COMPOSER_BUCKET,
+                object_name=gcs_object,
+                data=content.encode("utf-8"),
+                mime_type="text/x-python",
+            )
+
+            print(f"[DEPLOYED] '{label}' → gs://{COMPOSER_BUCKET}/{gcs_object}")
+            deployed_tables.append(
+                _entry(tbl, dag_filename=dag_filename, gcs_object=gcs_object)
+            )
+
+        except Exception as e:
+            print(f"[FAILED]   '{label}': {e}")
+            failed_tables.append(_entry(tbl, stage="dag_generation", error_message=str(e)))
+
+    ti.xcom_push(key="deployed_tables", value=deployed_tables)
+    ti.xcom_push(key="failed_tables",   value=failed_tables)
+
+
+# ── Task 4 — insert_sync_metadata ─────────────────────────────────────────────
+# Inserts a metadata row for every deployed DAG (is_active=TRUE) and also for
+# every skipped (duplicate) request (is_active=FALSE) so all requests are audited.
+def insert_sync_metadata(**kwargs):
+    ti              = kwargs["ti"]
+    deployed_tables = ti.xcom_pull(task_ids="generate_and_upload_dag", key="deployed_tables") or []
+    failed_tables   = ti.xcom_pull(task_ids="generate_and_upload_dag", key="failed_tables")   or []
+    skipped_tables  = ti.xcom_pull(task_ids="check_duplicate",         key="skipped_tables")  or []
+
+    tables_to_process = ti.xcom_pull(task_ids="check_duplicate", key="tables_to_process") or []
+    tables_map        = {_tbl_label(t): t for t in tables_to_process}
+
+    hook   = BigQueryHook(gcp_conn_id=HDL_CONN, use_legacy_sql=False)
+    conn   = hook.get_conn()
+    cursor = conn.cursor()
+
+    inserted_tables = []
+
+    # ── deployed tables → is_active = TRUE ──────────────────────────────────
+    for entry in deployed_tables:
+        label = entry["table"]
+        tbl   = tables_map.get(label)
+        if tbl is None:
+            failed_tables.append({
+                **entry,
+                "stage":         "metadata_insert",
+                "error_message": "Table dict not found in XCom — metadata insert skipped",
+            })
+            continue
+
+        try:
+            bq_table          = tbl["bq_table_full_name"]
+            td_table          = tbl["td_table_full_name"]
+            load_type         = tbl["load_type"]
+            job_ref           = str(tbl["job_ref"]).strip()
+            user_group        = str(tbl["user_group"]).strip()
+            rep_type          = tbl.get("replication_type", "time-driven")
+            schedule_interval = (
+                "" if rep_type == "event-driven"
+                else str(tbl.get("schedule_interval") or "00 00 * * *").strip()
+            )
+            requested_by      = str(tbl.get("requested_by", "")).strip()
+            lob               = str(tbl.get("LOB", "")).strip().upper()
+            app_name          = _get_app_name(lob, load_type)
+            dag_filename      = entry.get("dag_filename", "")
+
+            parts           = bq_table.split(".")
+            table_label     = f"{parts[-2]}__{parts[-1]}"
+            job_description = f"Run daily sync for {table_label} - {job_ref}"
+
+            notes = ""
+            if load_type == "Fullload_HashChunk":
+                hash_column       = str(tbl.get("hash_column", "")).strip()
+                total_hash_chunks = str(int(tbl.get("total_hash_chunks", 0)))
+                notes = f"hash_column={hash_column};total_hash_chunks={total_hash_chunks}"
+
+            insert_values = (
+                f"  '{bq_table}', '{td_table}', '{load_type}', '{app_name}', "
+                f"  '{schedule_interval}', '{job_ref}', '{job_description}', '{user_group}', "
+                f"  '{rep_type}', '{dag_filename}', '{requested_by}', '{lob}', '{notes}', TRUE"
+            )
+            insert_cols = (
+                f"  (bq_table_full_name, td_table_full_name, load_type, app_name, "
+                f"   schedule_interval, job_id, job_description, User_Group, "
+                f"   replication_type, dag_filename, requested_by, LOB, notes, is_active) "
+            )
+
+            cursor.execute(f"INSERT INTO `{SYNC_METADATA_TABLE}` {insert_cols} VALUES ({insert_values})")
+            print(f"[INSERTED] metadata for '{label}' → {SYNC_METADATA_TBL} (is_active=TRUE)")
+
+            if rep_type == "event-driven":
+                process_name      = str(tbl.get("process_name", "")).strip()
+                process_type_code = str(tbl.get("process_type_code", "")).strip()
+                control_table     = str(tbl.get("control_table_name", "")).strip()
+
+                evt_dup_query = (
+                    f"SELECT COUNT(*) FROM `{EVENT_METADATA_TABLE}` "
+                    f"WHERE bq_table_full_name  = '{bq_table}' "
+                    f"  AND td_table_full_name  = '{td_table}' "
+                    f"  AND process_name        = '{process_name}' "
+                    f"  AND process_type_code   = '{process_type_code}' "
+                    f"  AND control_table_name  = '{control_table}' "
+                    f"  AND is_active = TRUE"
+                )
+                cursor.execute(evt_dup_query)
+                evt_count = (cursor.fetchone() or [0])[0]
+
+                if evt_count == 0:
+                    cursor.execute(
+                        f"INSERT INTO `{EVENT_METADATA_TABLE}` "
+                        f"  (bq_table_full_name, td_table_full_name, process_name, "
+                        f"   process_type_code, control_table_name, is_active) "
+                        f"VALUES "
+                        f"  ('{bq_table}', '{td_table}', '{process_name}', "
+                        f"   '{process_type_code}', '{control_table}', TRUE)"
+                    )
+                    print(f"[INSERTED] event metadata for '{label}' → {EVENT_METADATA_TBL}")
+                else:
+                    print(f"[SKIPPED]  event metadata for '{label}' — mapping already active in {EVENT_METADATA_TBL}")
+
+            inserted_tables.append({**entry})
+
+        except Exception as e:
+            print(f"[FAILED]   metadata insert for '{label}': {e}")
+            failed_tables.append({
+                **entry,
+                "stage":         "metadata_insert",
+                "error_message": f"DAG deployed to GCS but metadata insert failed: {e}",
+            })
+
+    # ── skipped (duplicate) tables → is_active = FALSE ───────────────────────
+    for entry in skipped_tables:
+        label        = entry["table"]
+        existing_dag = entry.get("existing_dag", "N/A")
+        try:
+            bq_table          = entry["table"]
+            td_table          = entry["td_table"]
+            load_type         = entry["load_type"]
+            rep_type          = entry["replication_type"]
+            job_ref           = entry.get("job_ref", "")
+            user_group        = entry.get("user_group", "")
+            schedule_interval = entry.get("schedule_interval", "00 00 * * *")
+            requested_by      = entry.get("requested_by", "")
+            lob               = entry.get("LOB", "")
+            app_name          = _get_app_name(lob, load_type) if lob else ""
+
+            parts           = bq_table.split(".")
+            table_label     = f"{parts[-2]}__{parts[-1]}" if len(parts) >= 2 else bq_table
+            job_description = f"Run daily sync for {table_label} - {job_ref}"
+            notes           = f"Duplicate request — active DAG already exists: {existing_dag}"
+
+            dup_cols = (
+                f"  (bq_table_full_name, td_table_full_name, load_type, app_name, "
+                f"   schedule_interval, job_id, job_description, User_Group, "
+                f"   replication_type, dag_filename, requested_by, LOB, notes, is_active) "
+            )
+            dup_values = (
+                f"  '{bq_table}', '{td_table}', '{load_type}', '{app_name}', "
+                f"  '{schedule_interval}', '{job_ref}', '{job_description}', '{user_group}', "
+                f"  '{rep_type}', '{existing_dag}', '{requested_by}', '{lob}', '{notes}', FALSE"
+            )
+
+            cursor.execute(f"INSERT INTO `{SYNC_METADATA_TABLE}` {dup_cols} VALUES ({dup_values})")
+            print(f"[INSERTED] duplicate record for '{label}' → {SYNC_METADATA_TBL} (is_active=FALSE)")
+
+            if rep_type == "event-driven":
+                cursor.execute(f"INSERT INTO `{EVENT_METADATA_TABLE}` {dup_cols} VALUES ({dup_values})")
+                print(f"[INSERTED] duplicate record for '{label}' → {EVENT_METADATA_TBL} (is_active=FALSE)")
+
+        except Exception as e:
+            print(f"[WARN] Duplicate metadata insert failed for '{label}': {e}")
+            # not added to failed_tables — DAG was already not deployed, just logging
+
+    ti.xcom_push(key="inserted_tables", value=inserted_tables)
+    ti.xcom_push(key="failed_tables",   value=failed_tables)
+
+
+# ── Task 5 — send_summary_email ───────────────────────────────────────────────
+def send_summary_email(**kwargs):
+    ti     = kwargs["ti"]
+    params = _params(**kwargs)
+
+    email_id = str(params.get("email_id") or "").strip()
+    total    = len(_parse_tables(params))
+
+    inserted_tables = ti.xcom_pull(task_ids="insert_sync_metadata",  key="inserted_tables") or []
+    skipped_tables  = ti.xcom_pull(task_ids="check_duplicate",        key="skipped_tables")  or []
+
+    # Pull from the last task that executed — each stage accumulates prior failures.
+    failed_tables = (
+        ti.xcom_pull(task_ids="insert_sync_metadata",    key="failed_tables") or
+        ti.xcom_pull(task_ids="generate_and_upload_dag", key="failed_tables") or
+        ti.xcom_pull(task_ids="check_duplicate",         key="failed_tables") or
+        ti.xcom_pull(task_ids="validate_params",         key="failed_tables") or
+        []
+    )
+
+    deployed_count = len(inserted_tables)
+    skipped_count  = len(skipped_tables)
+    failed_count   = len(failed_tables)
+
+    # ── console summary ──────────────────────────────────────────────────────
+    print("=" * 60)
+    print("  TEMP SYNC SUMMARY")
+    print(f"  Total requested : {total}")
+    print(f"  Deployed        : {deployed_count}")
+    print(f"  Skipped         : {skipped_count}")
+    print(f"  Failed          : {failed_count}")
+    if skipped_tables:
+        print("\n  Skipped tables:")
+        for s in skipped_tables:
+            print(f"    {s['table']} — {s.get('error_message', '')}")
+    if failed_tables:
+        print("\n  Failed tables:")
+        for f in failed_tables:
+            print(f"    [{f.get('stage', '?')}] {f['table']} — {f.get('error_message', '')}")
+    print("=" * 60)
+
+    if not email_id:
+        print("No email_id provided — skipping summary email.")
+        return
+
+    # ── unified detail rows (Deployed → Skipped → Failed) ───────────────────
+    STATUS_COLOR = {
+        "Deployed": "#d4edda",   # green
+        "Skipped":  "#fff3cd",   # yellow
+        "Failed":   "#f8d7da",   # red
+    }
+
+    detail_rows = []
+
+    for t in inserted_tables:
+        detail_rows.append({
+            "table":            t.get("table", ""),
+            "td_table":         t.get("td_table", ""),
+            "load_type":        t.get("load_type", ""),
+            "replication_type": t.get("replication_type", ""),
+            "status":           "Deployed",
+            "error_message":    "",
+        })
+
+    for t in skipped_tables:
+        detail_rows.append({
+            "table":            t.get("table", ""),
+            "td_table":         t.get("td_table", ""),
+            "load_type":        t.get("load_type", ""),
+            "replication_type": t.get("replication_type", ""),
+            "status":           "Skipped",
+            "error_message":    t.get("error_message", ""),
+        })
+
+    for t in failed_tables:
+        detail_rows.append({
+            "table":            t.get("table", ""),
+            "td_table":         t.get("td_table", ""),
+            "load_type":        t.get("load_type", ""),
+            "replication_type": t.get("replication_type", ""),
+            "status":           "Failed",
+            "error_message":    t.get("error_message", ""),
+        })
+
+    detail_html = "".join(
+        f"<tr style='background-color:{STATUS_COLOR.get(r['status'], '#fff')}'>"
+        f"<td>{i + 1}</td>"
+        f"<td>{r['table']}</td>"
+        f"<td>{r['td_table']}</td>"
+        f"<td>{r['load_type']}</td>"
+        f"<td>{r['replication_type']}</td>"
+        f"<td><b>{r['status']}</b></td>"
+        f"<td style='text-align:left'>{r['error_message']}</td>"
+        f"</tr>"
+        for i, r in enumerate(detail_rows)
+    ) or "<tr><td colspan='7'>No data</td></tr>"
+
+    html = f"""
+    <html>
+    <style>
+      body {{ font-family: Arial, sans-serif; }}
+      table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
+      th {{ border: 2px solid #000; background-color: #b3d9ff; padding: 8px; text-align: center; }}
+      td {{ border: 1px solid #999; padding: 8px; text-align: center; vertical-align: top; }}
+    </style>
+    <body>
+      <h2>Temp Sync DAG Creator — Run Summary</h2>
+
+      <table style="width:35%">
+        <tr style="background-color:#88CEEB"><td><b>Metric</b></td><td><b>Count</b></td></tr>
+        <tr><td>Total Requested</td><td>{total}</td></tr>
+        <tr style="background-color:#d4edda"><td>Deployed</td><td>{deployed_count}</td></tr>
+        <tr style="background-color:#fff3cd"><td>Skipped</td><td>{skipped_count}</td></tr>
+        <tr style="background-color:#f8d7da"><td>Failed</td><td>{failed_count}</td></tr>
+      </table>
+
+      <h3>Table Details</h3>
+      <table>
+        <tr>
+          <th>Sr.</th>
+          <th>BQ Table</th>
+          <th>TD Table</th>
+          <th>Load Type</th>
+          <th>Replication Type</th>
+          <th>Status</th>
+          <th>Error Message</th>
+        </tr>
+        {detail_html}
+      </table>
+
+      <p style="font-size:9px;text-align:center">
+        System generated — do not reply<br>
+        HDL Temp Sync DAG Creator
+      </p>
+    </body>
+    </html>
+    """
+
+    recipients = [e.strip() for e in email_id.split(",") if e.strip()]
+    send_email(to=recipients, subject="HDL Temp Sync — DAG Creation Summary", html_content=html)
+    print(f"Summary email sent to: {recipients}")
+
+
+# ── DAG definition ─────────────────────────────────────────────────────────────
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": False,
+    "start_date": datetime(2025, 4, 9),
+    "retries": 0,
+}
+
+dag = DAG(
+    dag_id="Historical_Temp_Sync_Dag_Creator",
+    default_args=default_args,
+    description=(
+        "Creates temp-sync DAGs per table. Derives app_name from LOB. "
+        "Supports time-driven and event-driven (active); tls-driven (pending template). "
+        "Sends a per-run summary email with Deployed / Skipped / Failed status per table."
+    ),
+    schedule_interval=None,
+    catchup=False,
+    params={
+        # email_id: comma-separated recipients for the run summary report.
+        "email_id": "user@example.com",
+
+        # All other config is per-table inside the 'tables' list.
+        # LOB                : VCG | BODS | VBG
+        # load_type          : Fullload | Fullload_HashChunk | Incr_Append_Delete | Incr_Append
+        # replication_type   : time-driven (default) | event-driven | tls-driven
+        #                      event-driven → schedule_interval not required
+        # job_ref            : ETL job ID, script name, ticket — any free text
+        # job_description    : auto-generated ("Run daily sync for <table> - <job_ref>")
+        # --- Fullload_HashChunk only (for tables exceeding standard size limit) ---
+        # hash_column        : TD column used for HASHROW/HASHBUCKET partitioning (e.g. "customer_id")
+        # total_hash_chunks  : number of hash buckets to split the load into (e.g. 20)
+        # --- event-driven only ---
+        # process_name       : TD process/job name matched against control table
+        # process_type_code  : TD process type code (empty string for Marketo tables)
+        # control_table_name : one of AST.MARKETO_JOB_STATUS |
+        #                      SOURCE_SCHEMA_03.MARKETO_PRCS_CTRL |
+        #                      BODS_METADATA_VW.PRCS_CTRL | EDW_METADATA_VW.PRCS_CTRL
+        "tables": [
+            {
+                "bq_table_full_name": "project.dataset.table1",
+                "td_table_full_name": "td_database.td_table1",
+                "load_type":          "Fullload",
+                "LOB":                "VCG",
+                "replication_type":   "time-driven",
+                "schedule_interval":  "00 00 * * *",
+                "job_ref":            "ETL_JOB_001",
+                "user_group":         "your_user_group",
+                "requested_by":       "user@example.com",
+            },
+            {
+                "bq_table_full_name": "project.dataset.large_table",
+                "td_table_full_name": "td_database.large_table",
+                "load_type":          "Fullload_HashChunk",
+                "LOB":                "VCG",
+                "replication_type":   "time-driven",
+                "schedule_interval":  "00 23 28,29,30,31 * *",
+                "job_ref":            "ETL_JOB_003",
+                "user_group":         "your_user_group",
+                "requested_by":       "user@example.com",
+                "hash_column":        "customer_id",
+                "total_hash_chunks":  20,
+            },
+            {
+                "bq_table_full_name":  "project.dataset.table2",
+                "td_table_full_name":  "td_database.td_table2",
+                "load_type":           "Incr_Append",
+                "LOB":                 "VBG",
+                "replication_type":    "event-driven",
+                "job_ref":             "ETL_JOB_002",
+                "user_group":          "your_user_group",
+                "requested_by":        "user@example.com",
+                "process_name":        "YOUR_PROCESS_NAME",
+                "process_type_code":   "",
+                "control_table_name":  "EDW_METADATA_VW.PRCS_CTRL",
+            },
+        ],
+    },
+)
+
+validate = PythonOperator(
+    task_id="validate_params",
+    python_callable=validate_params,
+    provide_context=True,
+    dag=dag,
+)
+
+check_dup = PythonOperator(
+    task_id="check_duplicate",
+    python_callable=check_duplicate,
+    provide_context=True,
+    dag=dag,
+)
+
+generate_dag = PythonOperator(
+    task_id="generate_and_upload_dag",
+    python_callable=generate_and_upload_dag,
+    provide_context=True,
+    dag=dag,
+)
+
+insert_metadata = PythonOperator(
+    task_id="insert_sync_metadata",
+    python_callable=insert_sync_metadata,
+    provide_context=True,
+    dag=dag,
+)
+
+summary_email = PythonOperator(
+    task_id="send_summary_email",
+    python_callable=send_summary_email,
+    provide_context=True,
+    trigger_rule="all_done",   # always runs even if upstream tasks are skipped/failed
+    dag=dag,
+)
+
+validate >> check_dup >> generate_dag >> insert_metadata >> summary_email

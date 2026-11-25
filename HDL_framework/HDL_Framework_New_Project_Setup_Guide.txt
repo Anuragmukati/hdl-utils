@@ -1,0 +1,280 @@
+# HDL Framework: Setup Guide for a New Project Space or Environment
+
+This guide explains how to stand up the History Data Load (HDL) framework in a new GCP project space or a new environment. HDL loads Teradata tables into BigQuery with Apache Airflow (Cloud Composer). The optional Writeback (WB) framework, covered in section 9, goes the other way, from BigQuery to Teradata.
+
+**Note on file extensions:** every file in this package carries a .txt extension. Where this guide names a file such as SP_TGT_LOAD.sql or history_load_config_wave_hdl.json, rename the .txt copy back to its original extension before deploying. See File_Extension_Mapping.txt for the full list.
+
+Throughout this guide:
+
+| Placeholder | Meaning |
+|---|---|
+| `<prj>` | Short project code used in config keys and DAG names (for example `abcdo`). |
+| `<env>` | Environment suffix: `PLE` (pre-live) or `PP` (production). |
+| `<app_name>` | Application name used for routing, such as `<Prj>_PLE_Full` or `<Prj>_PP_Full`. |
+| `<PROJECT_ID>` | The GCP project ID that holds the BigQuery datasets for `<prj>`. |
+| `<COMPOSER_BUCKET>` | The Cloud Composer environment bucket that DAG files are deployed to. |
+
+---
+
+## 1. How the framework works
+
+Two environments take part:
+
+- **PLE (pre-live)** handles control, orchestration and audit.
+- **PROD** extracts the data and loads it.
+
+Loads run in this order:
+
+1. A user triggers a **pod DAG** (`history_load_dag_pod_pp` for PROD, `history_load_dag_pod_ple` for PLE) with a JSON config listing the tables.
+2. The pod DAG classifies each table and inserts it into a **queue table**. It does not load data itself.
+3. Per-project **loader DAGs** poll the queue tables every minute.
+   - NOS CSV queue: small tables.
+   - NOS Parquet queue: large tables, over 25 GB.
+   - TPT queue: full-load tables under 25 GB.
+4. A loader DAG that finds an entry extracts the table from Teradata to a GCS bucket (NOS or TPT). It then loads the files from GCS into the BigQuery target table, using the `SP_TGT_LOAD` or `SP_TGT_LOAD_APPEND` stored procedure.
+5. Metadata and audit rows are written for every table. The pod DAG waits for its tables to finish, with a hard timeout of 300 minutes, then logs a success, partial or failure summary.
+
+If a queue is empty, the loader DAG skips that run. Re-running a pod DAG is safe because the logic is idempotent.
+
+---
+
+## 2. What you need before you start
+
+Complete these items for each new project space.
+
+1. **GCS bucket for extracted files.** One bucket per project, with a 5-day lifecycle rule. Suggested name suffix: `nos-inbound`.
+2. **Composer connection ID for the project.** Onboard the project on the Composer environments so that an Airflow connection to its service account exists. The project's data owner usually has to request this.
+3. **Teradata NOS authorization.** Create an authorization object on Teradata for NOS with write access to the project's GCS bucket. Its service account looks like `service-account@<PROJECT_ID>.iam.gserviceaccount.com`. You will reference this object in the config (`TD_Auth`).
+4. **Cross-project read access (if you have a PLE project).** The PLE service account needs read access to the PROD GCS bucket.
+5. **Production service account read access.** The PROD service account needs read access to the project's GCS bucket, so that it can load the extracted files into BigQuery.
+6. **BigQuery datasets in the project.**
+
+   | Purpose | Dataset name |
+   |---|---|
+   | Stored procedures and ops tables | `edw_data_migration_ops_tbls` |
+   | Staging tables created at runtime | `edw_data_migration_opsstg_tbls` |
+   | Audit tables | `edw_data_migration_audit_tbls` |
+
+7. **Teradata connection on Composer.** Add the Teradata functional ID as an Airflow connection, and add the Kubernetes secret that holds the TPT credentials.
+8. **Composer access.** You need permission to trigger DAGs and upload to the Composer bucket.
+
+---
+
+## 3. Deploy the framework files to Composer
+
+Copy the contents of this package into the Composer DAGs folder, under a project-specific sub-folder. The setup DAGs read these paths:
+
+```
+<COMPOSER_BUCKET>/dags/<framework_folder>/
+    history_load_config_wave_hdl.json        (from Config/)
+    history_load_config_wave_wb.json         (from Config/, only if you use writeback)
+    Template/                                (from Template/HDL and Template/WB)
+    DDL/                                     (SP_TGT_LOAD.sql, SP_TGT_LOAD_APPEND.sql)
+    utility/                                 (setup and metadata DAGs)
+    POD/                                     (pod DAGs)
+    Plugins/                                 (multi_cron_timetable.py)
+```
+
+The setup DAGs hard-code the framework folder (`SOURCE_DIR`) and the Composer bucket (`COMPOSER_BUCKET`) at the top of the file. Edit both in `utility/Historical_New_Project_Dag_Setup.py` and `utility/WB_New_Project_Dag_Setup.py` to match your environment. In this package they still hold the placeholders `PROJECT_ID_25` and `BUCKET_NAME_29`.
+
+---
+
+## 4. Fill in the configuration
+
+The sanitized config files hold a one-line description of each expected value in `<angle brackets>`. Replace every description with the real value for your environment. The files are `Config/history_load_config_wave_hdl.json` and, for writeback, `Config/history_load_config_wave_wb.json`.
+
+### 4.1 Global keys (set once per environment)
+
+| Key | What to put |
+|---|---|
+| `TERADATA_HOSTNAME`, `TERADATA_USERNAME` | Teradata host and the service-account user. |
+| `deploy_target_pwd`, `secret`, `deploy_target_key_id`, `deploy_target_access_key_id` | The **names** of the environment variables or secrets that hold credentials. Never put the credentials themselves in the file. |
+| `GCP_CONN_ID`, `GCP_CONN_DO_ID` | Default Airflow connection IDs for the PROD and data-owner projects. |
+| `GCS_BUCKET`, `source_bucket` | Buckets used for TPT exports and NOS inbound files. |
+| `bq_source_project`, `bq_target_project`, `bq_target_dataset` | Default BigQuery source and target. |
+| `metadata_project`, `metadata_dataset` | Where the metadata tables live. |
+| `hdl_source_project`, `hdl_source_connection_id` | The project and connection used to read the HDL metadata, audit and instances config tables. |
+| `Metadata_Dataset`, `Audit_Dataset`, `Metadata_Tbl`, `Audit_Table`, `Queue_Table_large` | Framework table and dataset names. Keep the defaults unless you rename the tables. |
+| `TD_Auth` | The Teradata NOS authorization object names, in `schema.object` format. |
+| Tuning (`NUM_READ_INSTANCES`, `NUM_WRITE_INSTANCES`, `GCS_*`, `startup_timeout_seconds`, `namespace`, `image`, `kubernetes_conn_id`) | Defaults work in most cases. Adjust to your cluster. |
+
+### 4.2 Per-project keys (add six per new project)
+
+For every new `<prj>`, add these keys. `Historical_New_Project_Dag_Setup` refuses to run until all of them exist (`PRJ_REQUIRED_KEYS`).
+
+```json
+"GCP_CONN_DO_ID_<prj>":     "<Airflow connection ID for the project's data-owner service account>",
+"GCP_CONN_DO_ID_PLE_<prj>": "<Airflow connection ID for the project's PLE service account>",
+"bq_prod_project_<prj>":    "<GCP project ID of the BigQuery production project>",
+"bq_ple_project_<prj>":     "<GCP project ID of the BigQuery PLE project>",
+"gcs_bucket_name_<prj>":    "<GCS bucket name for the NOS inbound files>",
+"dag_folder_<prj>":         "<Name of the Composer DAGs sub-folder where the project's DAGs are deployed>"
+```
+
+For a new **environment** (for example a second Composer environment or a new landscape), the global keys change as well, because the connection IDs, hosts and buckets all differ. Treat it as a fresh copy of the config.
+
+---
+
+## 5. Create the BigQuery tables
+
+Run the DDL files in `DDL/` in each project that will host HDL tables. Replace the project and dataset placeholders first.
+
+| Order | File | Creates |
+|---|---|---|
+| 1 | `edw_data_migration_ops_tbls_historical_load_metadata_table.sql` | Metadata table. One row per table, with source and target names, load type, delta columns, size and activity flag. |
+| 2 | `edw_data_migration_audit_tbls_historical_load_audit_table.sql` | Audit table. Final status per table load. |
+| 3 | `edw_data_migration_ops_tbls_Nos_Queue_Table_Small.sql`, `..._Medium.sql`, `..._Large.sql` | NOS queue tables. |
+| 4 | `edw_data_migration_ops_tbls_table_schedule_config.sql` | Schedule config (table list, cron schedule, start and end dates) for scheduled and incremental loads. |
+| 5 | `edw_data_migration_ops_tbls.historical_load_event_based_metadata_table.sql`, `...temp_sync_metadata_table.sql` | Only if you use event-based or temp-sync loads. |
+| 6 | `SP_JOB_AUDIT_LOGGING.sql` | Audit-logging stored procedure. |
+
+You also need a `hdl_project_instances_config` table in `<Metadata_Dataset>`. `Historical_New_Project_Dag_Setup` upserts into it with a `MERGE` statement. Its columns are `prj`, `num_instances`, `dag_folder`, `env`, `app_name`, `last_updated_at` and `last_updated_by`. Create it before the first run, because no DDL file for it ships in this package.
+
+The stored procedures `SP_TGT_LOAD` and `SP_TGT_LOAD_APPEND` are created for you by the setup DAG (section 6). For writeback, the writeback metadata and audit DDLs are `edw_data_migration_audit_tbls_writeback_metadata_table.sql` and `..._writeback_audit_table.sql`.
+
+---
+
+## 6. Generate the per-project DAGs
+
+Trigger the Airflow DAG **`Historical_New_Project_Dag_Setup`** from the Airflow UI with "Trigger DAG w/ config". Run it once for `PLE` and once for `PP` if you have both.
+
+```json
+{
+  "prj": "<prj>",
+  "env": "PLE",
+  "app_name": "<Prj>_PLE_Full",
+  "num_instances": 2,
+  "refresh_all": false
+}
+```
+
+| Param | Meaning |
+|---|---|
+| `prj` | Project code. Must already exist in the config (section 4.2). |
+| `env` | `PLE` or `PP`. |
+| `app_name` | Application name used for routing. |
+| `num_instances` | How many parallel copies of the NOS CSV and Parquet loader DAGs to create. Default is 1. |
+| `refresh_all` | `false` runs the single-project path. `true` regenerates every project listed in `hdl_project_instances_config`. |
+
+With `refresh_all` set to `false`, the DAG runs these tasks in order:
+
+1. `validate_prj_config` checks that all six per-project keys exist.
+2. `cleanup_project_dags` deletes the existing generated DAG files for that project and environment from the Composer bucket.
+3. `save_child_instances` upserts the project into `hdl_project_instances_config`.
+4. In parallel:
+   - `generate_nos_csv_dag` writes `history_load_dag_nos_csv_small_<prj>_<ENV><n>.py`.
+   - `generate_nos_parquet_dag` writes `history_load_dag_nos_parquet_<prj>_<ENV><n>.py`.
+   - `generate_adhoc_csv_dag` and `generate_adhoc_parquet_dag` write the adhoc DAGs.
+   - `create_sp_tgt_load` and `create_sp_tgt_load_append` create the two stored procedures in the project's BigQuery project, replacing `@project`.
+
+Generated DAGs land in `<COMPOSER_BUCKET>/dags/<dag_folder>/{CSV|Parquet|ADHOC}/`. Composer picks them up after its next DAG-folder sync, usually within a few minutes.
+
+Use `refresh_all: true` after you change a template. It re-renders and re-uploads every project's DAGs and re-creates the stored procedures. Failures are reported per project in the task log, so search it for `[FAILED]` and `[SP_FAILED]`.
+
+---
+
+## 7. Create table metadata
+
+A table cannot load until it has a metadata row. Trigger **`hdl_metadata_creation_dag_for_all_UGs`**:
+
+```json
+{
+  "App_Name": "<Prj>_PP_Full",
+  "TD_Table_list": ["td_schema.table1", "td_schema.table2"],
+  "BQ_Table_list": ["bq_dataset.table1", "bq_dataset.table2"],
+  "Force_Full_Sync": "False"
+}
+```
+
+- `App_Name` must be one of the valid suffixes: `_PLE_Full`, `_PP_Full`, `_PP_Full_Daily`, `_PP_Full_Daily_R2`, `_PP_Incr_Daily`, `_PP_Incr_Daily_R2`.
+- `TD_Table_list` and `BQ_Table_list` are mapped by position, so they must have the same length and the same order.
+- `Force_Full_Sync: "False"` (recommended) only inserts rows that do not exist yet. `"True"` **deletes** existing metadata for the listed tables and recreates it, so use it with care.
+- The DAG has two tasks. `create_metadata_task` writes the metadata row. `update_bq_targets_task` fixes the target schema and table name when the Teradata and BigQuery names differ, and skips automatically when they match.
+
+---
+
+## 8. Run a load
+
+### 8.1 Standard load
+
+Trigger `history_load_dag_pod_pp` (PROD) or `history_load_dag_pod_ple` (PLE) from the Airflow UI. CLI and API triggering are not supported.
+
+```json
+{
+  "TD_Table_list": ["td_schema.table1", "td_schema.table2"],
+  "BQ_Table_list": ["bq_dataset.table1", "bq_dataset.table2"],
+  "App_Name": ["<Prj>_PP_Full", "<Prj>_PP_Full"],
+  "Email_id": "user1@example.com,user2@example.com"
+}
+```
+
+All lists are positional and must be the same length. `Email_id` is one quoted, comma-separated string that receives the HDL report. `Prod_load_flag` and `Ple_load_flag` are currently unused, and every triggered table is also copied to PLE.
+
+### 8.2 Adhoc load, for chunked loads or reruns after a failure
+
+Use the generated adhoc DAGs (`history_load_dag_nos_parquet_adhoc_<prj>_<ENV>` or `history_load_dag_nos_csv_adhoc_<prj>_<ENV>`):
+
+```json
+{
+  "BQ_Table": "dataset.table",
+  "Condition": " where 1=1 ",
+  "Ple_Load_flag": "False",
+  "tbl_load_type": "FullLoad"
+}
+```
+
+If `tbl_load_type` is passed, the table is truncated and loaded. If it is omitted, the data is appended to the existing data. This lets you load a big table in pieces by passing a different `Condition` each time.
+
+---
+
+## 9. Optional: Writeback (BigQuery to Teradata)
+
+1. Fill in `Config/history_load_config_wave_wb.json`. It has the same per-project keys as HDL (data-owner connection, BigQuery prod project, bucket, DAG folder), plus these global keys: `wb_source_project`, `wb_conn_id`, `wb_conn_id_pr`, `STS_conn_id`, `project_space`, `project_space_pr`, `composer_bucket` and `gcs_archival_bucket`.
+2. Create the writeback metadata and audit tables from the two `writeback_*` DDL files in `DDL/`. `WB_New_Project_Dag_Setup` also creates the metadata and audit tables in each project.
+3. Trigger **`WB_New_Project_Dag_Setup`** with `{"prj": "<prj>", "refresh_all": false}`. It generates, from `Template/WB`:
+   - one manual-trigger DAG,
+   - one scheduled-audit DAG,
+   - a DAG-generation utility,
+   - four auto-trigger DAGs by priority level: every 30 minutes (critical), hourly (high), every 2 hours (medium), every 4 hours (low).
+
+   They are written to the `WB` folder of the framework's deployment project. Use `refresh_all: true` to regenerate everything.
+
+---
+
+## 10. Monitoring and validation
+
+| What | Where to look |
+|---|---|
+| DAG and task logs | Composer UI for the pod DAG and the loader DAGs. |
+| Whether a table was queued | The queue tables in `edw_data_migration_ops_tbls`. |
+| Metadata and load lifecycle | `historical_load_metadata_table`. |
+| Final status per table | `historical_load_audit_table` in `edw_data_migration_audit_tbls`. |
+| Extracted files | The project's GCS `nos-inbound` bucket. |
+| Data in BigQuery | The target tables. Compare row counts with `utility/dag_table_count_td_bq_all.py`. |
+
+### Common issues
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Pod DAG fails at trigger | Malformed JSON config | Fix the JSON and re-trigger. |
+| Setup DAG fails at `validate_prj_config` | One of the six per-project keys is missing | Add the keys listed in the error message, redeploy the config, re-run. |
+| Table skipped | Wrong `App_Name` or pod routing, or a malformed entry | Check the queue table and validate `App_Name`. |
+| "Missing metadata" | Metadata DAG was not run or failed | Check its logs and re-run (section 7). |
+| Data not in BigQuery | File missing in GCS, or the BigQuery load failed | Trace through the DAG logs and the audit table. Also check the GCS read permissions from section 2. |
+| New DAGs do not appear | Composer has not synced yet, or the files went to the wrong `dag_folder` | Check the object path in the setup task log and wait for the sync. |
+
+---
+
+## 11. Checklist for a new project space
+
+- [ ] GCS bucket created with a 5-day lifecycle.
+- [ ] Composer connection and Teradata connection created.
+- [ ] Teradata NOS authorization created with write access to the bucket.
+- [ ] Cross-project and PROD service account read access granted.
+- [ ] Three datasets created in the BigQuery project.
+- [ ] DDLs from section 5 run, including `hdl_project_instances_config`.
+- [ ] Six per-project config keys added and config files uploaded to Composer.
+- [ ] `SOURCE_DIR` and `COMPOSER_BUCKET` updated in the setup DAGs.
+- [ ] `Historical_New_Project_Dag_Setup` run for each environment.
+- [ ] Metadata created for a test table.
+- [ ] Test load run end to end and checked in the audit table.

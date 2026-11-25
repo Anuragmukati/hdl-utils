@@ -1,0 +1,19 @@
+CREATE TABLE PROJECT_ID_01.edw_data_migration_ops_tbls.historical_load_temp_sync_metadata_table (
+    bq_table_full_name   STRING NOT NULL OPTIONS(description='Fully qualified BigQuery path: project.dataset.table'),
+    td_table_full_name   STRING NOT NULL OPTIONS(description='Fully qualified Teradata path: database.table'),
+    load_type            STRING          OPTIONS(description='Fullload | Incr_Append_Delete | Incr_Append'),
+    app_name             STRING          OPTIONS(description='Derived from LOB and load_type'),
+    schedule_interval    STRING          OPTIONS(description='Cron expression for time-driven replication'),
+    job_id               STRING NOT NULL OPTIONS(description='ETL job ID, script name, or ticket reference'),
+    job_description      STRING          OPTIONS(description='Auto-generated: Run daily sync for <table> - <job_ref>'),
+    User_Group           STRING NOT NULL OPTIONS(description='User group for which this temp sync is required'),
+    replication_type     STRING          OPTIONS(description='time-driven | event-driven | tls-driven'),
+    dag_filename         STRING          OPTIONS(description='history_load_dag__{Table_Name}_daily_{Tbl_Load_Type}.py'),
+    requested_by         STRING          OPTIONS(description='Email of the person who requested the sync'),
+    notes                STRING          OPTIONS(description='Remarks — e.g., duplicate request note'),
+    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_by           STRING    ,
+    is_active            BOOL      DEFAULT TRUE
+)
+CLUSTER BY app_name, bq_table_full_name;

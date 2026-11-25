@@ -1,0 +1,742 @@
+[
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/addr_xref.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/addr_xref_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/aedw_ll_account.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/aedw_ll_account_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/all_prod.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/all_prod_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/bad_state_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/bad_state_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/bec_build_bqt_vsb_univ.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm810/bec_build_bqt_vsb_univ_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/bill_grp.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/bill_grp_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/build_car_mart_delete.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm822/build_car_mart_delete_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_addr_featr_daily.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm447/cdi_addr_featr_daily_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_addr_till_tbls_daily.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_addr_till_tbls_daily_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_el_acctprfl_2.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm123/cdi_el_acctprfl_2_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_el_prflind_upd.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm123/cdi_el_prflind_upd_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_el_prodprfl.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm123/cdi_el_prodprfl_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_el_wtnprfl_1daily.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm123/cdi_el_wtnprfl_1daily_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_el_wtnprfl_2.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm123/cdi_el_wtnprfl_2_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_keys_xref.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_keys_xref_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_acct_load_step1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_acct_load_step1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_acct_load_step1_v5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_acct_load_step1_v5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_acct_load_step2.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_acct_load_step2_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_acct_load_step3.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_acct_load_step3_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_acct_load_step4.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_acct_load_step4_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_acct_load_step4_v5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_acct_load_step4_v5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_acct_load_step5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_acct_load_step5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_acct_load_step5_v5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_acct_load_step5_v5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_acct_load_step6.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_acct_load_step6_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_addr_spet1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_addr_spet1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_addr_spet10.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_addr_spet10_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_addr_spet2.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_addr_spet2_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_addr_spet3.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_addr_spet3_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_addr_spet4.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_addr_spet4_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_addr_spet5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_addr_spet5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_addr_spet6.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_addr_spet6_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_addr_spet7.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_addr_spet7_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_addr_spet8.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_addr_spet8_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_addr_spet8_v5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_addr_spet8_v5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cdi_run_addr_spet9.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/cdi_run_addr_spet9_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cn_pup_map.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/cn_pup_map_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cpi_clli_btch_mode_var.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/cpi_clli_btch_mode_var_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/cpi_vzid_btch_mode_var.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/cpi_vzid_btch_mode_var_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/duplicate_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/duplicate_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/dv_tv_data_tmp.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/dv_tv_data_tmp_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/east_prod_step1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/east_prod_step1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/east_prod_step2.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/east_prod_step2_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/east_prod_step3.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/east_prod_step3_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/east_prod_step4.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/east_prod_step4_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/east_prod_step5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/east_prod_step5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/east_prod_step6.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/east_prod_step6_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/east_rpts_view_losses.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm125/east_rpts_view_losses_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/etf_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/etf_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/exp_product_type_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/exp_product_type_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/expected_date.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/expected_date_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/fiddates_parsing.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm802/fiddates_parsing_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/fios_mog_fexp_conversion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/fios_mog_fexp_conversion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gh05_gph_final_rev_q1_p1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm94540/gh05_gph_final_rev_q1_p1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gh05_gph_load_summary_q1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm94540/gh05_gph_load_summary_q1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gh05_gph_rcm_datamove_q1_p1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm94540/gh05_gph_rcm_datamove_q1_p1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gh05_gph_rtn_credit_rev_q1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm94540/gh05_gph_rtn_credit_rev_q1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gh05_gph_stndby_rev_vbm_p1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm94551/gh05_gph_stndby_rev_vbm_p1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gh05_gph_stndby_rev_vbm_p2.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm94551/gh05_gph_stndby_rev_vbm_p2_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gh05_gph_taxes_v450_rev_q1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm94540/gh05_gph_taxes_v450_rev_q1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_clear_staging.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95600/gph_clear_staging_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_acquisition_cost.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95600/gph_curr_acquisition_cost_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_content_cost.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95600/gph_curr_content_cost_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_content_cost_vbm.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95601/gph_curr_content_cost_vbm_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_cost_control.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95600/gph_curr_cost_control_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_cost_control_vbm.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95601/gph_curr_cost_control_vbm_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_custcare_dispatch_cost.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95600/gph_curr_custcare_dispatch_cost_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_custcare_dispatch_cost_vbm.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95601/gph_curr_custcare_dispatch_cost_vbm_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_equipment_cost_vbm.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95601/gph_curr_equipment_cost_vbm_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_other_cost.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95600/gph_curr_other_cost_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_other_cost_vbm.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95601/gph_curr_other_cost_vbm_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_other_phase2_cost.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95600/gph_curr_other_phase2_cost_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_curr_other_phase2_cost_vbm.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95601/gph_curr_other_phase2_cost_vbm_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/gph_p4mth_margin_vbm.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95601/gph_p4mth_margin_vbm_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/hoa_vvp_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/hoa_vvp_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/implicit_pg_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/implicit_pg_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/key_stat.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/key_stat_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/line_all_daily_after_key.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/line_all_daily_after_key_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/line_all_daily_after_key_v5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/line_all_daily_after_key_v5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/line_all_daily_step1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/line_all_daily_step1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/line_all_daily_step2.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/line_all_daily_step2_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/line_all_daily_step2_v5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/line_all_daily_step2_v5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/line_all_daily_step3.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/line_all_daily_step3_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/line_all_daily_step3_v5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/line_all_daily_step3_v5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/line_all_daily_step4.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/line_all_daily_step4_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/line_all_daily_step4_v5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/line_all_daily_step4_v5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/line_all_daily.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/line_all_daily_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/line_all_daily_v5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/line_all_daily_v5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/localtv_product_type_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/localtv_product_type_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/m_h_fios_orders_30day.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm823/m_h_fios_orders_30day_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/m_h_kickoff_check.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm823/m_h_kickoff_check_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/m_h_smart_cart_prd1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm8241/m_h_smart_cart_prd1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/m_h_vzt_cust_profile.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm823/m_h_vzt_cust_profile_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/m_h_vzt_sales.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm823/m_h_vzt_sales_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/marketingprofile_acq.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/marketingprofile_acq_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/marketprofile_final.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/marketprofile_final_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/marketprofile_post.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/marketprofile_post_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/marketprofile_pre.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/marketprofile_pre_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mdva_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/mdva_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mog_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/mog_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mog_mapping_bundle_2019.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/mog_mapping_bundle_2019_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mog_mapping.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/mog_mapping_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mp_prspct_ll_upd.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/mp_prspct_ll_upd_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_acct_bos_cust.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_acct_bos_cust_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_acct_bus_cust.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_acct_bus_cust_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_acct_bus_prospect.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_acct_bus_prospect_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_acct_bus_wb.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_acct_bus_wb_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_acct_keys_combination.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_acct_keys_combination_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_acct_keys_res.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_acct_keys_res_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_acct_prod.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm449/mu_acct_prod_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_acct_res_anon.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_acct_res_anon_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_acct_res_cust.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_acct_res_cust_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_acct_res_pros.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_acct_res_pros_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_acct_res_wb.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_acct_res_wb_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_bus_acct_keys.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_bus_acct_keys_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_daily_rename.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm449/mu_daily_rename_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_demog_res.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_demog_res_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_fios_eligible.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm449/mu_fios_eligible_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_master_update_res.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_master_update_res_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_model_scor_anon.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_model_scor_anon_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_model_scor_res.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_model_scor_res_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_res_loc_res.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_res_loc_res_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/mu_res_qa.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/mu_res_qa_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/muwtnmstr.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm450/muwtnmstr_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/nbo_cpni_default.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/nbo_cpni_default_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ndb_cleanup.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm872/ndb_cleanup_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ndb_sh1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm872/ndb_sh1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ndb_sh2.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm872/ndb_sh2_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ndb_sh3.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm872/ndb_sh3_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ndb_sh4.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm872/ndb_sh4_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ndb_sh4_valid.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm872/ndb_sh4_valid_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ndb_sh5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm872/ndb_sh5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ne_exnevo.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm402/ne_exnevo_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ne_reports_mm.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/ne_reports_mm_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ne_reports.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/ne_reports_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/non-active_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/non-active_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ntas_aais_etrak.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/ntas_aais_etrak_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/omni_competr.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm447/omni_competr_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/onebill.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm622/onebill_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ont_inactive_sspinfo_merge.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm739/ont_inactive_sspinfo_merge_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/party.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/party_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/price_stability_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/price_stability_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/price_stability_tracker.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/price_stability_tracker_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/product_type_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/product_type_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/prop_flat.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm322/prop_flat_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/prop_stg.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm322/prop_stg_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/purge_hist_stage.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwmnphst/purge_hist_stage_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/six_month_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/six_month_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/sp_core_acct_sum_bteq_tt1_monthly.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm384/sp_core_acct_sum_bteq_tt1_monthly_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/sp_core_cops_bteq_tt1_monthly.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm384/sp_core_cops_bteq_tt1_monthly_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ssp_all_daily.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/ssp_all_daily_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ssp_cpf_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/ssp_cpf_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ssp_mdr.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/ssp_mdr_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ssp_patch_daily.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/ssp_patch_daily_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ssp_prod_step5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/ssp_prod_step5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ssp_prod_step6.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/ssp_prod_step6_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ssp_prod_step7.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/ssp_prod_step7_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ssp_prod_step8.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/ssp_prod_step8_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/svc_pnt_addr_id_fix.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/svc_pnt_addr_id_fix_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/svc_pnt_cntl_dt_fix.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/svc_pnt_cntl_dt_fix_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/tactview_post.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/tactview_post_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/tactview_pre.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/tactview_pre_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/tactview_tt8.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/tactview_tt8_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/toll_carr_xref_part2.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/toll_carr_xref_part2_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/ueo_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/ueo_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/update_mog_hist.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm806/update_mog_hist_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/v5b608_extract.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm87300/v5b608_extract_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/vision_all_daily_v5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/vision_all_daily_v5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/voice_consumption.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/voice_consumption_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/voice_consumption_v5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/voice_consumption_v5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/vvl_reports.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm720/vvl_reports_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/vz_internal_account_exclusion.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/vz_internal_account_exclusion_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/vzt_identify_flag_home_cust.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm82315/vzt_identify_flag_home_cust_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/vzt_vzw_activation_histstage.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwmn1wac/vzt_vzw_activation_histstage_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/vzt_vzw_activation_inp_trkg_insert.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwmn1wac/vzt_vzw_activation_inp_trkg_insert_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/wave_exc_2019.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/wave_exc_2019_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/west_prod_step0.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/west_prod_step0_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/west_prod_step1.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/west_prod_step1_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/west_prod_step2.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/west_prod_step2_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/west_prod_step3.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/west_prod_step3_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/west_prod_step4.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/west_prod_step4_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/west_prod_step5.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm457/west_prod_step5_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/wr106061_bundle_sph_keys.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/wr106061_bundle_sph_keys_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/wr106061_bundle_sph_mog_fexp.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/wr106061_bundle_sph_mog_fexp_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/wr106270_bct_sph_keys.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/wr106270_bct_sph_keys_stg2tgt.sql"
+    },
+    {
+      "SOURCE_Path": "C:/Users/mukatan/Downloads/Bteq_Output/Output/wr106363_ny_sph_map.bteq",
+      "dest_path": "C:/WLN/data-owner/src/main/bq-sql/dwm95202/wr106363_ny_sph_map_stg2tgt.sql"
+    }
+  ]

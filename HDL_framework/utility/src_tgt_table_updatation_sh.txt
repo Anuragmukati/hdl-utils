@@ -1,0 +1,53 @@
+#!/bin/bash
+
+# Check if two arguments are provided
+if [ "$#" -ne 3 ]; then
+  echo "Invalid number of Arguments"
+  echo "Usage: $0 \"'src_db.src_tbl1','src_db.src_tbl2'\" \"'tgt_db.tgt_tbl1','tgt_db2.tgt_tbl1'\" "APP_NAME""
+  exit 1
+fi
+
+src_list_str=$1
+tgt_list_str=$2
+
+# Remove single quotes and split the strings into arrays
+IFS=',' read -r -a src_array <<< "${src_list_str//\'/}"
+IFS=',' read -r -a tgt_array <<< "${tgt_list_str//\'/}"
+
+# Check if the number of source and target tables match
+if [ "${#src_array[@]}" -ne "${#tgt_array[@]}" ]; then
+  echo "Error: The number of source tables (${#src_array[@]}) does not match the number of target tables (${#tgt_array[@]}). Please ensure the lists have the same count."
+  exit 1
+fi
+
+# Run this once if it's a prerequisite
+ sh proddo.sh 
+
+# Loop through the arrays using a C-style for loop
+for ((i=0; i<${#src_array[@]}; i++)); do
+  # Get the current source and target full table names
+  src_full_tbl="${src_array[$i]}"
+  tgt_full_tbl="${tgt_array[$i]}"
+
+  # Split the source full table into src_db and src_tbl
+  src_db=$(echo "$src_full_tbl" | cut -d'.' -f1)
+  src_tbl=$(echo "$src_full_tbl" | cut -d'.' -f2)
+
+  # Split the target full table into tgt_db and tgt_tbl
+  tgt_db=$(echo "$tgt_full_tbl" | cut -d'.' -f1)
+  tgt_tbl=$(echo "$tgt_full_tbl" | cut -d'.' -f2)
+
+  # Generate the SQL statement using printf
+  # The printf command will format the string and assign it to the 'sql' variable
+  printf -v sql "Update PROJECT_ID_31.edw_data_migration_ops_tbls.historical_load_metadata_table set tgt_table='%s',tgt_schema='%s',table_uid='%s__%s',stg_table='%s__%s' where app_name='$3' and lower(src_schema)=lower('%s') and lower(src_table)=lower('%s');" \
+    "$(echo "$tgt_tbl" | tr '[:upper:]' '[:lower:]')" \
+    "$(echo "$tgt_db" | tr '[:upper:]' '[:lower:]')" \
+    "$tgt_db" "$tgt_tbl" \
+    "$tgt_db" "$tgt_tbl" \
+    "$src_db" "$src_tbl"
+ 
+  # Pass the fully formatted SQL query to bq_query.sh
+  echo $sql
+  #sh proddo.sh
+  sh bq_query.sh "$sql"
+done

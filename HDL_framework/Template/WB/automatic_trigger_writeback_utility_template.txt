@@ -1,0 +1,405 @@
+import logging
+import json
+import random
+from datetime import datetime, timedelta
+import teradatasql
+import pendulum
+from airflow import DAG
+from airflow.decorators import task
+from airflow.hooks.base import BaseHook
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.operators.empty import EmptyOperator
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+
+logger = logging.getLogger("airflow.task")
+
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_25/"
+
+def read_config():
+    with open(f'{BASE_DIR}history_load_config_wave_wb.json', 'r') as f:
+        return json.load(f)
+
+config = read_config()
+
+# ── Set project here — all connections and project spaces are derived from this ──
+# Valid projects: zdwvdo/zdwvbizdo/coasdo/bglodo/bgtsdo/bhubdo/bopsdo/bsopdo/bsyido
+#                 factdo/fcredo/ffrado/frvado/vcgfdofbi/vcgfdofnv/vcgfdocfc/vcgfdorbi
+project          = "zdwvdo"
+BQ_CONN_ID       = config[f"GCP_CONN_DO_ID_{project}"]
+BQ_PROJECT       = config[f"bq_prod_project_{project}"]
+dag_folder       = config[f"dag_folder_{project}"]
+# ─────────────────────────────────────────────────────────────────────────────────
+
+TD_CONN_ID_ALL = ['UWBGCPDTSSLA1', 'UWBGCPDTSSLA2', 'UWBGCPDTSSLA3']
+TD_CONN_ID = TD_CONN_ID_ALL[random.randint(0, len(TD_CONN_ID_ALL) - 1)]
+
+BQ_METADATA_TABLE = f"{BQ_PROJECT}.edw_data_migration_audit_tbls.edw_mig_bq_to_td_writeback_metadata"
+BQ_AUDIT_TABLE    = f"{BQ_PROJECT}.edw_data_migration_audit_tbls.edw_mig_bq_to_td_writeback_audit_updated"
+
+LOAD_INSTANCES_FILTER = @load_instance
+DAG_ID            = f"dg_{project}_bq2td_automatic_trigger_writeback_utility_li@load_instance"
+schedule_interval = '@schedule'
+
+local_tz = pendulum.timezone("America/New_York")
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2026, 3, 9, tzinfo=local_tz),
+    'retries': 0
+}
+
+
+def format_td_timestamp(ts_str):
+    if not ts_str:
+        return None
+    return ts_str.replace('T', ' ').split('.')[0]
+
+
+def format_td_time(tm_str):
+    if not tm_str:
+        return None
+    return tm_str.split('.')[0]
+
+
+def task_status_callback(context):
+    ti = context['task_instance']
+    map_index = ti.map_index
+    all_metadata = ti.xcom_pull(task_ids='bulk_audit_init')
+    if not all_metadata or map_index >= len(all_metadata):
+        return
+    conf = all_metadata[map_index]
+    run_id = context['run_id']
+    start_time_est = pendulum.instance(ti.start_date).in_timezone('America/New_York').format('YYYY-MM-DD HH:mm:ss') if ti.start_date else None
+    end_time_est = (
+        pendulum.instance(ti.end_date).in_timezone('America/New_York').format('YYYY-MM-DD HH:mm:ss')
+        if ti.end_date else pendulum.now('America/New_York').format('YYYY-MM-DD HH:mm:ss')
+    )
+    state = ti.state
+    status = "SUCCESS" if state == "success" else "FAILED"
+    bq_count, td_count = None, None
+
+    if state == "success":
+        try:
+            insert_table_load_status_from_var(run_id, conf['td_table_name'])
+            counts = fetch_counts(conf.copy())
+            bq_count = counts.get('bq_count')
+            td_count = counts.get('td_count')
+            if bq_count is not None and td_count is not None:
+                if int(bq_count) != int(td_count):
+                    status = "COUNT_MISMATCH"
+            else:
+                status = "COUNT_FETCH_FAILED"
+        except Exception as e:
+            logger.error(f"Count fetch failed for {conf.get('bq_table_name')}: {e}")
+            status = "COUNT_FETCH_FAILED"
+
+    result_payload = {
+        **conf,
+        "status": status,
+        "bq_count": bq_count,
+        "td_count": td_count,
+        "start_time": start_time_est,
+        "end_time": end_time_est
+    }
+    ti.xcom_push(key="final_audit_record", value=result_payload)
+
+
+def insert_table_load_status_from_var(run_id, target_table_name):
+    conn_config = BaseHook.get_connection(TD_CONN_ID)
+    all_records = json.loads(Variable.get(f"bq_wb_metadata_{project}_{run_id}", default_var="[]"))
+    target_name_raw = target_table_name.split(".")[1].lower()
+    current_date_est = pendulum.now('America/New_York').format('YYYY-MM-DD')
+    filtered_records = []
+
+    for r in all_records:
+        if r[0].lower() == target_name_raw:
+            if str(r[2]) == str(current_date_est):
+                params = (r[0], r[1], r[2], format_td_time(r[3]), format_td_timestamp(r[4]), None, None, None, 0, 0, 0, 0, 0, 'BQ2TD', r[13])
+            else:
+                params = (
+                    r[0], r[1],
+                    r[2],
+                    format_td_time(r[3]),
+                    format_td_timestamp(r[4]),
+                    r[5],
+                    format_td_time(r[6]),
+                    format_td_timestamp(r[7]),
+                    0, 0, 0, 0, 0, 'BQ2TD', r[13]
+                )
+            filtered_records.append(params)
+
+    if not filtered_records:
+        logger.warning(f"No records found in Variable for table: {target_table_name}")
+        return
+
+    insert_sql = """
+        INSERT INTO SOURCE_SCHEMA_01.TABLE_LOAD_STATUS (
+            TABLENAME, SOR_ID,
+            LOAD_START_DT, LOAD_START_TM, LOAD_START_TIMESTAMP,
+            LOAD_COMPLETION_DT, LOAD_COMPLETION_TM, LOAD_COMPLETION_TIMESTAMP,
+            INSERT_CNT, UPDATE_CNT, DELETE_CNT, ET_CNT, UV_CNT,
+            LOAD_TYPE, COMMENT_TEXT
+        ) VALUES (
+            ?, ?,
+            COALESCE(CAST(? AS DATE), CURRENT_DATE),
+            ?,
+            COALESCE(CAST(? AS TIMESTAMP(0)), CURRENT_TIMESTAMP(0)),
+            COALESCE(CAST(? AS DATE), CURRENT_DATE),
+            COALESCE(CAST(? AS TIME(0)), CURRENT_TIME(0)),
+            COALESCE(CAST(? AS TIMESTAMP(0)), CURRENT_TIMESTAMP(0)),
+            ?, ?, ?, ?, ?,
+            ?, ?
+        );
+    """
+    conn = teradatasql.connect(host=conn_config.host, user=conn_config.login, password=conn_config.password)
+    cursor = conn.cursor()
+    try:
+        cursor.executemany(insert_sql, filtered_records)
+        conn.commit()
+        logger.info(f"Successfully inserted {len(filtered_records)} rows into TABLE_LOAD_STATUS")
+    except Exception:
+        conn.rollback()
+        logger.exception(f"Teradata insert failed for {target_table_name}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def fetch_counts(record: dict):
+    bq_hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID)
+    project_nm = record.get('project_name', BQ_PROJECT)
+
+    try:
+        bq_query = f"SELECT CAST(COUNT(*) AS BIGINT) AS cnt FROM `{project_nm}.{record['bq_table_name']}`"
+        df = bq_hook.get_pandas_df(sql=bq_query, dialect="standard", location="US")
+        bq_count = int(df['cnt'][0])
+    except Exception as e:
+        logger.warning("Failed to fetch BQ count for %s: %s", record['bq_table_name'], e)
+        bq_count = None
+
+    try:
+        conn_info = BaseHook.get_connection(TD_CONN_ID)
+        with teradatasql.connect(host=conn_info.host, user=conn_info.login, password=conn_info.password) as td_conn:
+            td_cursor = td_conn.cursor()
+            td_cursor.execute(f"SELECT CAST(COUNT(*) AS BIGINT) FROM {record['td_table_name']}")
+            td_count = int(td_cursor.fetchone()[0])
+            td_cursor.close()
+    except Exception as e:
+        logger.warning("Failed to fetch TD count for %s: %s", record['td_table_name'], e)
+        td_count = None
+
+    record.update({
+        'bq_count': bq_count,
+        'td_count': td_count,
+        'data_size_gb': record.get('bq_table_logical_size_gb', 'NA')
+    })
+    logger.info("Fetched counts for %s — BQ: %s | TD: %s | Size: %s GB",
+                record['bq_table_name'], bq_count, td_count, record['data_size_gb'])
+    return record
+
+
+with DAG(
+    dag_id=DAG_ID,
+    start_date=datetime(2026, 3, 9, tzinfo=local_tz),
+    schedule_interval=schedule_interval,
+    max_active_runs=3,
+    max_active_tasks=50,
+    catchup=False,
+    default_args=default_args,
+    description="Trigger writeback DAGs with BQ & Teradata counts and audit tracking",
+    params={"bq_table_names": ""}
+) as dag:
+
+    start = EmptyOperator(task_id="start")
+    end   = EmptyOperator(task_id="end", trigger_rule=TriggerRule.ALL_DONE)
+
+    @task
+    def fetch_metadata(**context):
+        hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID)
+        run_id = context["run_id"]
+        data_interval_start = context.get("data_interval_start")
+        data_interval_end   = context.get("data_interval_end")
+
+        query = f"""
+WITH latest_audit AS (
+    SELECT bq_table_name, MAX(start_time) AS last_writeback_ts
+    FROM `{BQ_AUDIT_TABLE}`
+    WHERE lower(writeback_status) IN ('success', 'count_mismatch')
+    GROUP BY 1
+)
+SELECT
+    m.*,
+    ROUND(s.total_logical_bytes / POW(1024, 3), 2) AS bq_table_logical_size_gb,
+    ts.tablename      AS TABLENAME,
+    ts.sor_id         AS SOR_ID,
+    ts.load_start_dt  AS LOAD_START_DT,
+    ts.load_start_tm  AS LOAD_START_TM,
+    ts.load_start_timestamp    AS LOAD_START_TIMESTAMP,
+    ts.load_completion_dt      AS LOAD_COMPLETION_DT,
+    ts.load_completion_tm      AS LOAD_COMPLETION_TM,
+    ts.load_completion_timestamp AS LOAD_COMPLETION_TIMESTAMP,
+    ts.comment_text   AS COMMENT_TEXT,
+    ts.instance_ind   AS INSTANCE_IND,
+    COALESCE(CAST(s.storage_last_modified_time AS STRING), '') AS storage_last_modified_time
+FROM `{BQ_PROJECT}.region-us.INFORMATION_SCHEMA.TABLE_STORAGE` s
+INNER JOIN `{BQ_METADATA_TABLE}` m
+    ON (s.table_schema || '.' || s.table_name) = m.bq_table_name
+LEFT JOIN latest_audit a
+    ON (s.table_schema || '.' || s.table_name) = a.bq_table_name
+LEFT JOIN `{BQ_PROJECT}.ntl_prd_allvm.table_load_status_v` ts
+    ON SPLIT(m.bq_table_name, '.')[SAFE_OFFSET(1)] = LOWER(ts.tablename)
+    AND DATETIME(CAST(ts.LOAD_COMPLETION_TIMESTAMP AS TIMESTAMP), 'America/New_York') > a.last_writeback_ts
+WHERE
+    s.storage_last_modified_time
+        BETWEEN TIMESTAMP_SUB(TIMESTAMP('{ data_interval_start }'), INTERVAL 10 MINUTE)
+            AND TIMESTAMP_SUB(TIMESTAMP('{ data_interval_end }'), INTERVAL 10 MINUTE)
+    AND m.is_active = TRUE
+    AND m.load_instances = {LOAD_INSTANCES_FILTER}
+    AND m.app_name = '{project}'
+"""
+        logger.info("Fetching writeback metadata for project: %s", project)
+        print(query)
+
+        df = hook.get_pandas_df(sql=query, dialect="standard", location="US")
+        for col in df.select_dtypes(include=['datetime64', 'datetimetz']).columns:
+            df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+        records = df.to_dict(orient='records')
+
+        cols_to_remove = [
+            'TABLENAME', 'SOR_ID',
+            'LOAD_START_DT', 'LOAD_START_TM', 'LOAD_START_TIMESTAMP',
+            'LOAD_COMPLETION_DT', 'LOAD_COMPLETION_TM', 'LOAD_COMPLETION_TIMESTAMP',
+            'COMMENT_TEXT', 'INSTANCE_IND'
+        ]
+
+        df_cleaned = df.drop(columns=cols_to_remove, errors='ignore').drop_duplicates()
+        records_cleaned = df_cleaned.to_dict(orient='records')
+
+        airflow_var_payload = []
+        for _, row in df.iterrows():
+            if row.get("TABLENAME") and str(row["TABLENAME"]).strip() != "":
+                airflow_var_payload.append([
+                    row["TABLENAME"],
+                    row["SOR_ID"],
+                    str(row["LOAD_START_DT"])          if row["LOAD_START_DT"]          else None,
+                    str(row["LOAD_START_TM"])          if row["LOAD_START_TM"]          else None,
+                    str(row["LOAD_START_TIMESTAMP"])   if row["LOAD_START_TIMESTAMP"]   else None,
+                    str(row["LOAD_COMPLETION_DT"])     if row["LOAD_COMPLETION_DT"]     else None,
+                    str(row["LOAD_COMPLETION_TM"])     if row["LOAD_COMPLETION_TM"]     else None,
+                    str(row["LOAD_COMPLETION_TIMESTAMP"]) if row["LOAD_COMPLETION_TIMESTAMP"] else None,
+                    0, 0, 0, 0, 0,
+                    row["COMMENT_TEXT"],
+                    row["INSTANCE_IND"]
+                ])
+            else:
+                logger.info(f"Skipping TABLE_LOAD_STATUS payload for {row['bq_table_name']} — ts metadata is NULL.")
+
+        if not records:
+            logger.warning("No matching metadata found.")
+        else:
+            logger.info("Fetched %d metadata records", len(records))
+            if airflow_var_payload:
+                Variable.set(
+                    key=f"bq_wb_metadata_{project}_{run_id}",
+                    value=json.dumps(airflow_var_payload)
+                )
+                logger.info(f"Saved {len(airflow_var_payload)} records to Airflow Variable.")
+            else:
+                logger.warning("No ts records found; Airflow Variable not updated.")
+
+        return records_cleaned
+
+    @task
+    def bulk_audit_init(metadata_list: list, **context):
+        ti = context['task_instance']
+        if not metadata_list:
+            return
+        hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID)
+        exec_hour = context['execution_date'].strftime('%H:00')
+        start_time_est = (
+            pendulum.instance(ti.start_date).in_timezone('America/New_York').format('YYYY-MM-DD HH:mm:ss')
+            if ti.start_date else None
+        )
+
+        values_list = []
+        for record in metadata_list:
+            values_list.append(f"""(
+                '{record['bq_table_name']}', '{record['td_table_name']}', '{exec_hour}', 'RUNNING',
+                '{record.get('bq_table_logical_size_gb', '')}', '{record.get('function_id', '')}',
+                '{record.get('writeback_composer_instance', '')}', '{record['writeback_dag_name']}',
+                '{record.get('load_type', '')}', '{record.get('load_functionality', '')}',
+                CURRENT_TIMESTAMP(), '{start_time_est}', '{record['storage_last_modified_time']}', 'framework_triggered'
+            )""")
+
+        insert_query = f"""
+            INSERT INTO `{BQ_AUDIT_TABLE}`
+            (bq_table_name, td_table_name, execution_hour, writeback_status, data_size_gb,
+             functional_id, composer_instance, writeback_dag_name, load_type, load_functionality,
+             audit_ts, start_time, table_last_modified_when_wb, trigger_type)
+            VALUES {", ".join(values_list)}
+        """
+        hook.run_query(sql=insert_query, use_legacy_sql=False)
+        return metadata_list
+
+    metadata_records = fetch_metadata()
+    init_audit_data  = bulk_audit_init(metadata_records)
+
+    trigger_worker = TriggerDagRunOperator.partial(
+        task_id="trigger_dag",
+        wait_for_completion=True,
+        deferrable=True,
+        poke_interval=60,
+        on_success_callback=task_status_callback,
+        on_failure_callback=task_status_callback,
+        execution_timeout=timedelta(hours=6),
+        retries=0
+    ).expand_kwargs(
+        init_audit_data.map(lambda x: {
+            "trigger_dag_id": x["writeback_dag_name"],
+            "conf": x,
+            "task_id": f"trigger_{x['bq_table_name'].replace('.', '_')}"
+        })
+    )
+
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def bulk_audit_finalize(**context):
+        ti = context['ti']
+        all_results = ti.xcom_pull(task_ids='trigger_dag', key='final_audit_record', map_indexes=None)
+        if not all_results:
+            logger.warning("No audit records found in XCom.")
+            return
+
+        valid_results = [r for r in all_results if r is not None]
+        values_list = []
+        for res in valid_results:
+            bq_cnt   = f"'{res['bq_count']}'" if res['bq_count'] is not None else "NULL"
+            td_cnt   = f"'{res['td_count']}'" if res['td_count'] is not None else "NULL"
+            end_time = f"'{res['end_time']}'"   if res.get('end_time', '')   not in [None, 'NULL', ''] else "CURRENT_DATETIME()"
+            start_time = f"'{res['start_time']}'" if res.get('start_time', '') not in [None, 'NULL', ''] else "CURRENT_DATETIME()"
+
+            values_list.append(f"""(
+                '{res['bq_table_name']}', '{res['td_table_name']}', '{res['status']}',
+                {bq_cnt}, {td_cnt}, CURRENT_TIMESTAMP(), {end_time}, {start_time},
+                'framework_triggered', '{res['writeback_dag_name']}', '{res['bq_table_logical_size_gb']}',
+                '{res['load_type']}', '{res['load_functionality']}', '{res['storage_last_modified_time']}'
+            )""")
+
+        if values_list:
+            bulk_sql = f"""
+                INSERT INTO `{BQ_AUDIT_TABLE}`
+                (bq_table_name, td_table_name, writeback_status, bq_count, td_count,
+                 audit_ts, end_time, start_time, trigger_type, writeback_dag_name,
+                 data_size_gb, load_type, load_functionality, table_last_modified_when_wb)
+                VALUES {", ".join(values_list)}
+            """
+            BigQueryHook(gcp_conn_id=BQ_CONN_ID).run_query(sql=bulk_sql, use_legacy_sql=False)
+            logger.info(f"Bulk insert complete: {len(values_list)} records processed.")
+
+    mapped_results = bulk_audit_finalize()
+
+    start >> metadata_records >> init_audit_data >> trigger_worker >> mapped_results >> end

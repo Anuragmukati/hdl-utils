@@ -1,0 +1,11 @@
+CREATE TABLE PROJECT_ID_01.edw_data_migration_ops_tbls.historical_load_event_based_metadata_table (
+    bq_table_full_name   STRING NOT NULL OPTIONS(description='Fully qualified BigQuery path: project.dataset.table'),
+    td_table_full_name   STRING NOT NULL OPTIONS(description='Fully qualified Teradata path: database.table'),
+    process_type_code STRING NOT NULL OPTIONS(description='Name of process code get used to popluate data in TD'),
+    process_name          STRING NOT NULL OPTIONS(description='Name of process get used to popluate data in TD'),
+    control_table_name     STRING NOT NULL OPTIONS(description='Name of control table which is used for process'),
+    time_interval_minutes    INT64  DEFAULT 0        OPTIONS(description='Time interval in minutes to load data after process completion'),
+    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,   
+    is_active            BOOL      DEFAULT TRUE
+)
+CLUSTER BY app_name, bq_table_full_name;

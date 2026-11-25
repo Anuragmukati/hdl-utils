@@ -1,0 +1,325 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowFailException
+from airflow.providers.google.cloud.operators.bigquery import BigQueryHook
+
+import json
+from datetime import datetime
+from datetime import datetime
+import sys
+import random
+import time
+import pendulum
+
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_25/"
+sys.path.append(f"{BASE_DIR}/")
+
+local_tz = pendulum.timezone("America/New_York")
+
+WAVE_CONFIG_PATH = f"{BASE_DIR}history_load_config_wave_hdl.json"
+
+def read_config():
+    with open(WAVE_CONFIG_PATH, 'r') as f:
+        return json.load(f)
+
+
+config = read_config()
+
+
+Metadata_db              = config["Metadata_Dataset"]
+Metadata_tbl             = config["Metadata_Tbl"]
+HDL_project              = config["hdl_source_project"]
+hdl_source_connection_id = config["hdl_source_connection_id"]
+
+
+VALID_APP_SUFFIXES = {
+    "_PLE_Full":           "ple",
+    "_PP_Full":            "prod",
+    "_PP_Full_Daily":      "prod",
+    "_PP_Full_Daily_R2":   "prod",
+    "_PP_Incr_Daily":      "prod",
+    "_PP_Incr_Daily_R2":   "prod",
+}
+
+
+def get_project_from_app_name(app_name):
+    app_upper = app_name.upper()
+    matched_type = None
+    for suffix, proj_type in VALID_APP_SUFFIXES.items():
+        if app_upper.endswith(suffix.upper()):
+            matched_type = proj_type
+            break
+
+    if matched_type is None:
+        raise AirflowFailException(
+            f"App_Name '{app_name}' does not match any valid pattern. "
+            f"Valid suffixes: {', '.join(VALID_APP_SUFFIXES.keys())}"
+        )
+
+    prj        = app_name.split("_")[0].lower()
+    config_key = f"bq_ple_project_{prj}" if matched_type == "ple" else f"bq_prod_project_{prj}"
+
+    if config_key not in config:
+        raise AirflowFailException(
+            f"No configuration found for App_Name '{app_name}' (prj='{prj}'). "
+            f"Missing key '{config_key}' in history_load_config_wave_hdl.json"
+        )
+
+    return config[config_key]
+
+
+time.sleep(random.randint(1,18))
+
+
+def parse_table_items(table_list):
+    tables = []
+    for item in table_list:
+        item = str(item).strip()
+        if '.' not in item:
+            raise AirflowFailException(
+                f"Invalid table entry '{item}'. Expected format: 'schema.table'"
+            )
+        parts = item.split('.', 1)
+        tables.append((parts[0].strip(), parts[1].strip()))
+    return tables
+
+
+def create_metadata(**kwargs):
+
+    Table_list    = kwargs['dag_run'].conf.get('TD_Table_list', [])
+    BQ_Table_list = kwargs['dag_run'].conf.get('BQ_Table_list', [])
+    App_Name      = kwargs['dag_run'].conf.get('App_Name', '')
+    Force_Full_Sync = kwargs['dag_run'].conf.get('Force_Full_Sync', 'False')
+
+    if not Table_list:
+        raise AirflowFailException("Please provide Table_list (TD source tables)")
+    if not BQ_Table_list:
+        raise AirflowFailException("Please provide BQ_Table_list (BQ target tables)")
+    if not App_Name:
+        raise AirflowFailException("Please provide App_Name")
+
+    td_tables = parse_table_items(Table_list)
+    bq_tables = parse_table_items(BQ_Table_list)
+    if len(td_tables) != len(bq_tables):
+        raise AirflowFailException(
+            f"Table count mismatch: TD_Table_list has {len(td_tables)} entries "
+            f"but BQ_Table_list has {len(bq_tables)} entries. Both lists must have the same count."
+        )
+
+    hook = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+
+    prd_proj     = get_project_from_app_name(App_Name)
+    td_sql_in    = ", ".join(f"'{db}.{tbl}'" for db, tbl in td_tables)
+    tbl_names_in = ", ".join(f"'{tbl.lower()}'" for _, tbl in td_tables)
+    input_by_tbl = {tbl.lower(): f"{db}.{tbl}" for db, tbl in td_tables}
+
+    pre_check_sql = (
+        f"SELECT LOWER(TRIM(src_table)) "
+        f"FROM {HDL_project}.{Metadata_db}.{Metadata_tbl} "
+        f"WHERE app_name = '{App_Name}' "
+        f"AND LOWER(TRIM(src_table)) IN ({tbl_names_in})"
+    )
+    cursor.execute(pre_check_sql)
+    already_in_metadata = {row[0] for row in cursor.fetchall()}
+    tables_to_insert    = set(input_by_tbl.keys()) - already_in_metadata
+
+    if str(Force_Full_Sync).lower() == 'true':
+        bq_sql_in     = ", ".join(f"'{db}.{tbl}'" for db, tbl in bq_tables)
+        delete_sql_TD = f'DELETE FROM {HDL_project}.{Metadata_db}.{Metadata_tbl} WHERE lower(concat(src_schema,".",src_table)) in ({td_sql_in}) AND App_Name="{App_Name}"'
+        delete_sql_BQ = f'DELETE FROM {HDL_project}.{Metadata_db}.{Metadata_tbl} WHERE lower(concat(tgt_schema,".",tgt_table)) in ({bq_sql_in}) AND App_Name="{App_Name}"'
+        try:
+            cursor.execute(delete_sql_TD)
+            cursor.execute(delete_sql_BQ)
+            print(f"[INFO] Force_Full_Sync=True: Deleted existing metadata for {len(already_in_metadata)} table(s), will re-insert all.")
+            already_in_metadata = set()
+            tables_to_insert    = set(input_by_tbl.keys())
+        except:
+            print("Delete Query Execution Failed")
+            raise AirflowFailException("Delete Query Execution Failed")
+    
+    metadata_creation_sql=f"insert into {HDL_project}.{Metadata_db}.{Metadata_tbl} (is_table_active,table_uid,src_schema,src_table,stg_schema,stg_table,tgt_schema,tgt_table,load_type,delta_column,delta_column_type,delta_column_format,delta_interval,app_name,src_table_size,src_table_row_count,src_table_type,bus_key_column,change_value_column,start_date_column,end_date_column,stg_load_enabled,plican_validation_enabled,select_query,load_functionality,select_query_tpt,spool_flag,bq_to_bq_query,stg_project_id,tgt_project_id)     WITH cte1 AS (     SELECT     c.databasename,     c.tablename,     c.columnName,     c.columntype,     c.Nullable,     c.columnlength,     t.total_size_GB,     row_number() OVER (PARTITION BY c.databasename, c.tablename ORDER BY c.columnid) columnid,      (     CASE     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'N' THEN     CONCAT(     'CASE WHEN RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\' \\'), CHR(13), \\' \\')) = \\'\\' ',     'THEN \\' \\' ELSE RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\' \\'), CHR(13), \\' \\')) ',     'END AS \"', TRIM(columnname), '\"'     )     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength <= 20 AND Nullable = 'N' THEN     CONCAT(     'CASE WHEN RTRIM(\"', TRIM(columnname), '\") = \\'\\' ',     'THEN \\' \\' ELSE RTRIM(\"', TRIM(columnname), '\") END AS \"', TRIM(columnname), '\"'     )     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'Y' THEN     CONCAT('RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\' \\'), CHR(13), \\' \\')) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND Nullable = 'Y' THEN     CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('D','F','N') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS DECIMAL(38,19)) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('I1') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS INTEGER) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('BF','BO') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS VARBYTE(10000)) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('DA','DT') THEN     CONCAT('TO_CHAR(\"', TRIM(columnname), '\", \\'YYYY-MM-DD\\') AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('AT') THEN     CONCAT('TO_CHAR(\"', TRIM(columnname), '\",\\'HH24:MI:SS.FF6\\') AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('TS','TZ') THEN     CONCAT(     'TO_CHAR(CASE WHEN \"', TRIM(columnname), '\" >= TIMESTAMP \\'9999-12-31 23:59:59\\' ',     'THEN TIMESTAMP \\'9999-12-31 23:59:59.000000\\' ELSE \"', TRIM(columnname),     '\" END, \\'YYYY-MM-DD HH24:MI:SS.FF6\\') AS \"', TRIM(columnname), '\"'     )     ELSE     CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')     END     ) AS NEW_COLUMN,      (     CASE     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'N' THEN     CONCAT(     'CASE WHEN RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\'\\' \\'\\'), CHR(13),\\'\\' \\'\\')) = \\'\\'\\'\\' ',     'THEN \\'\\' \\'\\' ELSE RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\'\\' \\'\\'), CHR(13), \\'\\' \\'\\')) ',     'END AS \"', TRIM(columnname), '\"'     )     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength <= 20 AND Nullable = 'N' THEN     CONCAT(     'CASE WHEN RTRIM(\"', TRIM(columnname), '\") = \\'\\'\\'\\' ',     'THEN \\'\\' \\'\\' ELSE RTRIM(\"', TRIM(columnname), '\") END AS \"', TRIM(columnname), '\"'     )     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'Y' THEN     CONCAT('RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \\'\\' \\'\\'), CHR(13), \\'\\' \\'\\')) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('CO','SC','JN','XM','UT','VA','CF','CV') AND Nullable = 'Y' THEN     CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')     ELSE     CONCAT('\"', TRIM(columnname), '\"')     END     ) AS NEW_COLUMN_TPT,      (     CASE     WHEN columntype IN ('SC','JN','XM','UT','VA','CF','CV')  THEN     CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('BF','BO') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS VARBYTE(10000)) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('AT') THEN     CONCAT('CAST(CAST(\"', TRIM(columnname), '\" AS TIME(6) FORMAT \\'HH:MI:SS.s(6)\\') AS VARCHAR(16)) AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('DA','DT') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS DATE FORMAT \\'YYYY-MM-DD\\') AS \"', TRIM(columnname), '\"')     WHEN columntype IN ('TS','SZ', 'TZ') THEN     CONCAT(     'CAST(CAST(CASE WHEN \"', TRIM(columnname), '\" >= TIMESTAMP \\'9999-12-31 23:59:59\\' ',     'THEN TIMESTAMP \\'9999-12-31 23:59:59\\' ELSE \"', TRIM(columnname),     '\" END AS TIMESTAMP(6) FORMAT \\'YYYY-MM-DDBHH:MI:SS.S(6)\\') AS VARCHAR(26)) AS \"', TRIM(columnname), '\"'     )     WHEN columntype IN ('D','N','F') THEN     CONCAT('CAST(\"', TRIM(columnname), '\" AS VARCHAR(100)) AS \"', TRIM(columnname), '\"')  WHEN columntype In ('CO') THEN CONCAT('CAST(\"', TRIM(columnname),'\" as VARCHAR(30000)) AS \"',TRIM(columnname),'\"') WHEN columntype In ('HS') THEN CONCAT('CAST(\"', TRIM(columnname),'\" as VARCHAR(15)) AS \"',TRIM(columnname),'\"')     ELSE     CONCAT('\"', TRIM(columnname), '\"')     END     ) AS NEW_COLUMN_BQ_TO_BQ      FROM     {HDL_project}.{Metadata_db}.dbc_columnsv c LEFT JOIN {HDL_project}.{Metadata_db}.dbc_tablesizev t     ON TRIM(LOWER(c.databasename)) = TRIM(LOWER(t.databasename))     AND TRIM(LOWER(c.tablename)) = TRIM(LOWER(t.tablename))     WHERE         LOWER(CONCAT(TRIM(c.databasename), '.', TRIM(c.tablename))) IN ({td_sql_in})     ),      cte2 AS (     SELECT     databasename,     tablename,     total_size_GB,     STRING_AGG(NEW_COLUMN ORDER BY columnid) AS selectcol,     STRING_AGG(NEW_COLUMN_TPT ORDER BY columnid) AS selectcol_tpt,     STRING_AGG(NEW_COLUMN_BQ_TO_BQ ORDER BY columnid) AS selectcol_bq     FROM     cte1     GROUP BY 1, 2, 3     )      SELECT     TRUE AS is_table_active,     CONCAT(TRIM(databasename), '__', TRIM(tablename)) AS table_uid,     case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end AS src_schema,     TRIM(tablename) AS src_table,     'edw_data_migration_opsstg_tbls' AS stg_schema,     CONCAT(LOWER(TRIM(databasename)), '__', LOWER(TRIM(tablename))) AS stg_table,     LOWER(TRIM(databasename)) AS tgt_schema,     LOWER(TRIM(tablename)) AS tgt_table,     'FullLoad' AS load_type,     '' AS delta_column,     '' AS delta_column_type,     '' AS delta_column_format,     0 AS delta_interval,     '{App_Name}' AS app_name,     CONCAT(CAST(total_size_GB AS STRING), 'GB') AS src_table_size,     0 AS src_table_row_count,     CASE     WHEN total_size_GB > 499 THEN 'Large'     WHEN total_size_GB > 100 THEN 'Medium'     ELSE 'Small'     END AS src_table_type,     '' AS bus_key_column,     '' AS change_value_column,     '' AS start_date_column,     '' AS end_date_column,     False AS stg_load_enabled,     False AS plican_validation_enabled,     CONCAT('select ', selectcol, ' from ', case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end, '.', TRIM(tablename)) AS select_query,     'NOS' AS load_functionality,     CONCAT('select ', selectcol_tpt, ' from ',case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end,'.',TRIM(tablename)) AS select_query_tpt,     0 AS SPOOL_FLAG,     CONCAT('select ', selectcol_bq, ' from ',case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end, '.', TRIM(tablename)) as bq_to_bq_query,     '{prd_proj}' AS stg_project_id,     '{prd_proj}' AS tgt_project_id     FROM     cte2 WHERE CONCAT(LOWER(case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end),LOWER(TRIM(tablename)),'{App_Name}')  NOT IN (Select CONCAT(LOWER(TRIM(src_schema)),LOWER(TRIM(src_table)),app_name) from  {HDL_project}.{Metadata_db}.{Metadata_tbl} ); "
+    try:
+        cursor.execute(metadata_creation_sql)
+    except Exception as e:
+        print(f"\n{'='*60}")
+        print(f"[ERROR] Metadata Creation Query Execution Failed: {e}")
+        if tables_to_insert:
+            print(f"[FAILED] {len(tables_to_insert)} table(s) where metadata was NOT inserted:")
+            for t in sorted(tables_to_insert):
+                print(f"  x {input_by_tbl[t]}")
+        print(f"{'='*60}\n")
+        raise AirflowFailException("Metadata Creation Query Execution Failed")
+
+    rows_affected = cursor.rowcount
+
+    cursor.execute(pre_check_sql)
+    now_in_metadata = {row[0] for row in cursor.fetchall()}
+    newly_inserted  = now_in_metadata - already_in_metadata
+    failed_tables   = tables_to_insert - now_in_metadata
+    skipped_tables  = already_in_metadata
+
+    print(f"\n{'='*60}")
+    print(f"METADATA CREATION SUMMARY  |  App_Name: {App_Name}")
+    print(f"{'='*60}")
+    print(f"  Total input tables : {len(input_by_tbl)}")
+    if skipped_tables:
+        print(f"  Already existed    : {len(skipped_tables)}  (skipped - use Force_Full_Sync=True to overwrite)")
+    print(f"  Newly inserted     : {len(newly_inserted)}")
+    print(f"  Failed             : {len(failed_tables)}")
+    print(f"  DB rows affected   : {rows_affected}")
+
+    if newly_inserted:
+        print(f"\n  [SUCCESS] Tables with metadata inserted ({len(newly_inserted)}):")
+        for t in sorted(newly_inserted):
+            print(f"    + {input_by_tbl[t]}")
+
+    if skipped_tables:
+        print(f"\n  [SKIPPED] Tables already had metadata, not re-inserted ({len(skipped_tables)}):")
+        for t in sorted(skipped_tables):
+            print(f"    ~ {input_by_tbl.get(t, t)}")
+
+    not_on_td   = set()
+    found_on_td = set()
+    if failed_tables:
+        failed_sql_in = ", ".join(f"'{input_by_tbl[t].lower()}'" for t in failed_tables)
+        td_check_sql = (
+            f"SELECT DISTINCT LOWER(TRIM(databasename)), LOWER(TRIM(tablename)) "
+            f"FROM {HDL_project}.{Metadata_db}.dbc_columnsv "
+            f"WHERE LOWER(CONCAT(TRIM(databasename), '.', TRIM(tablename))) IN ({failed_sql_in})"
+        )
+        try:
+            cursor.execute(td_check_sql)
+            found_on_td = {f"{row[0]}.{row[1]}" for row in cursor.fetchall()}
+        except Exception as td_e:
+            print(f"  [WARN] Could not check TD existence via dbc_columnsv: {td_e}")
+
+        not_on_td = {t for t in failed_tables if input_by_tbl[t].lower() not in found_on_td}
+
+        print(f"\n  [FAILED] Tables where metadata was NOT inserted ({len(failed_tables)}):")
+        for t in sorted(failed_tables):
+            full_name = input_by_tbl[t]
+            if t in not_on_td:
+                print(f"    x {full_name}  [REASON: table not found in TD (dbc_columnsv) - verify database/table name]")
+            else:
+                print(f"    x {full_name}  [REASON: table exists on TD but metadata insertion failed - check for duplicates or schema issues]")
+
+    print(f"{'='*60}\n")
+
+    if failed_tables:
+        not_on_td_names  = sorted(input_by_tbl[t] for t in not_on_td)
+        other_fail_names = sorted(input_by_tbl[t] for t in failed_tables - not_on_td)
+        msg_parts = []
+        if not_on_td_names:
+            msg_parts.append(f"not found on TD: {', '.join(not_on_td_names)}")
+        if other_fail_names:
+            msg_parts.append(f"insertion failed: {', '.join(other_fail_names)}")
+        raise AirflowFailException(
+            f"DAG failed: {len(failed_tables)} table(s) not inserted "
+            f"({len(newly_inserted)} successfully inserted). "
+            + "; ".join(msg_parts)
+        )
+
+
+def update_bq_targets(**kwargs):
+    TD_Table_list = kwargs['dag_run'].conf.get('TD_Table_list', [])
+    BQ_Table_list = kwargs['dag_run'].conf.get('BQ_Table_list', [])
+    App_Name      = kwargs['dag_run'].conf.get('App_Name', '')
+
+    td_tables = parse_table_items(TD_Table_list)
+    bq_tables = parse_table_items(BQ_Table_list)
+
+    hook   = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+    conn   = hook.get_conn()
+    cursor = conn.cursor()
+
+    success_list = []
+    skipped_list = []
+    failed_list  = []
+
+    for (td_db, td_tbl), (bq_db, bq_tbl) in zip(td_tables, bq_tables):
+        if td_db.lower() == bq_db.lower() and td_tbl.lower() == bq_tbl.lower():
+            skipped_list.append(f"{td_db}.{td_tbl}")
+            continue
+
+        bq_db_lower  = bq_db.lower()
+        bq_tbl_lower = bq_tbl.lower()
+        update_sql = (
+            f"UPDATE `{HDL_project}.{Metadata_db}.{Metadata_tbl}` "
+            f"SET "
+            f"  tgt_table  = '{bq_tbl_lower}', "
+            f"  tgt_schema = '{bq_db_lower}', "
+            f"  table_uid  = '{bq_db}__{bq_tbl}', "
+            f"  stg_table  = '{bq_db}__{bq_tbl}' "
+            f"WHERE App_Name = '{App_Name}' "
+            f"  AND LOWER(src_schema) = LOWER('{td_db}') "
+            f"  AND LOWER(src_table)  = LOWER('{td_tbl}')"
+        )
+        try:
+            cursor.execute(update_sql)
+            success_list.append(f"{td_db}.{td_tbl} -> {bq_db}.{bq_tbl}  (rows: {cursor.rowcount})")
+        except Exception as e:
+            failed_list.append(f"{td_db}.{td_tbl}")
+            print(f"  [FAIL] Update failed for {td_db}.{td_tbl}: {e}")
+            raise AirflowFailException(f"BQ target update failed for {td_db}.{td_tbl}: {e}")
+
+    print(f"\n{'='*60}")
+    print(f"BQ TARGET UPDATE SUMMARY  |  App_Name: {App_Name}")
+    print(f"{'='*60}")
+    print(f"  Updated  : {len(success_list)}")
+    print(f"  Skipped  : {len(skipped_list)}")
+    print(f"  Failed   : {len(failed_list)}")
+
+    if success_list:
+        print(f"\n  [SUCCESS] BQ targets updated ({len(success_list)}):")
+        for t in success_list:
+            print(f"    + {t}")
+
+    if skipped_list:
+        print(f"\n  [SKIPPED] TD/BQ names identical, no update needed ({len(skipped_list)}):")
+        for t in skipped_list:
+            print(f"    ~ {t}")
+
+    print(f"{'='*60}\n")
+
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 4, 9,tzinfo=local_tz),
+    'retries': 0
+}
+
+dag = DAG(
+    dag_id=f"hdl_metadata_creation_dag_for_all_UGs",
+    default_args=default_args,
+    description="DAG to insert metadata for historical load tables",
+    schedule_interval=None,
+    max_active_runs=5,
+    catchup=False,
+    params={
+        "TD_Table_list":  ["td_db.td_tbl1", "td_db.td_tbl2"],
+        "BQ_Table_list":  ["bq_dataset.bq_tbl1", "bq_dataset.bq_tbl2"],
+        "App_Name":       "Gk1vdo_PP_Full",
+        "Force_Full_Sync": "False",
+    },
+
+)
+    
+
+create_metadata_task = PythonOperator(
+    task_id='create_metadata_task',
+    python_callable=create_metadata,
+    dag=dag,
+    provide_context=True,
+)
+
+update_bq_targets_task = PythonOperator(
+    task_id='update_bq_targets_task',
+    python_callable=update_bq_targets,
+    dag=dag,
+    provide_context=True,
+)
+
+create_metadata_task >> update_bq_targets_task

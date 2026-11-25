@@ -1,0 +1,103 @@
+from airflow import DAG
+from airflow.decorators import task
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.operators.bigquery import BigQueryHook
+from airflow.exceptions import AirflowFailException
+from datetime import datetime
+import pendulum
+import json
+import sys
+
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_130/"
+sys.path.append(f"{BASE_DIR}/")
+
+local_tz = pendulum.timezone("America/New_York")
+def read_config():
+    with open('/home/airflow/gcs/dags/PROJECT_ID_130/history_load_config_prod_hdl.json', 'r') as f:
+        confid_details = json.load(f)
+    return confid_details
+
+
+config = read_config()
+
+
+Metadata_db=config["Metadata_Dataset"]
+Metadata_tbl=config["Metadata_Tbl"]
+HDL_project=config["hdl_source_project"]
+hdl_source_connection_id=config["hdl_source_connection_id"]
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 4, 9,tzinfo=local_tz),
+    'retries': 0
+}
+
+dag = DAG(
+    dag_id=f"bq_metadata_update_migration",
+    default_args=default_args,
+    description="DAG to update src and tgt tables in metadata table",
+    schedule_interval=None,
+    max_active_runs=5,
+    catchup=False,
+    params={
+        "App_Name": "Gk1vdo_PP_Full",
+        "Source_Table_List":"'src_db.src_tbl1','src_db.src_tbl2'",
+        "Target_Table_List":"'tgt_db.tgt_tbl1','tgt_db2.tgt_tbl1'"
+    },
+
+)
+   
+   
+def prepare_sql_queries(**kwargs):
+    
+    app_name=kwargs['dag_run'].conf.get('App_Name','')
+    src_str=kwargs['dag_run'].conf.get('Source_Table_List','')
+    tgt_str=kwargs['dag_run'].conf.get('Target_Table_List','')
+    src_array = [s.strip("'") for s in src_str.split(',')]
+    tgt_array = [t.strip("'") for t in tgt_str.split(',')]
+
+    if len(src_array) == 0 or len(tgt_array) == 0:
+        raise AirflowFailException("Source or Target table list is empty")
+    elif len(src_array) != len(tgt_array):
+        raise AirflowFailException(f"Mismatch: {len(src_array)} sources vs {len(tgt_array)} targets")
+    
+    hook = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+
+    if len(src_array) != len(tgt_array):
+        raise ValueError(f"Mismatch: {len(src_array)} sources vs {len(tgt_array)} targets")
+
+    for src_full, tgt_full in zip(src_array, tgt_array):
+        src_db, src_tbl = src_full.split('.')
+        tgt_db, tgt_tbl = tgt_full.split('.')
+
+        sql = f"""
+        UPDATE `{HDL_project}.{Metadata_db}.{Metadata_tbl}`
+        SET tgt_table='{tgt_tbl.lower()}',
+            tgt_schema='{tgt_db.lower()}',
+            table_uid='{tgt_db}__{tgt_tbl}',
+            stg_table='{tgt_db}__{tgt_tbl}'
+        WHERE app_name='{app_name}'
+            AND LOWER(src_schema)=LOWER('{src_db}')
+            AND LOWER(src_table)=LOWER('{src_tbl}');
+        """
+        try:
+            cursor.execute(sql)
+        except:
+            print("Metadata Creation Query Execution Failed")
+            raise AirflowFailException("Metadata Creation Query Execution Failed")    
+    
+    
+
+
+
+update_metadata=PythonOperator(
+    task_id='update_bq_metadata',
+    python_callable=prepare_sql_queries,
+    dag=dag,
+    provide_context=True
+)
+
+update_metadata

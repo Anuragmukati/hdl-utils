@@ -1,0 +1,339 @@
+import logging
+import json
+from datetime import datetime,timedelta
+import random
+import teradatasql
+import pendulum
+import time
+import pytz
+from airflow import DAG
+from airflow.decorators import task
+from airflow.hooks.base import BaseHook
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.operators.empty import EmptyOperator
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.operators.email import EmailOperator
+import sys
+from airflow.providers.teradata.hooks.teradata import TeradataHook
+import pandas as pd
+
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_25/"
+sys.path.append(f"{BASE_DIR}/")
+
+
+def read_config():
+    with open('/home/airflow/gcs/dags/PROJECT_ID_25/history_load_config_wave_hdl.json', 'r') as f:
+        confid_details = json.load(f)
+    return confid_details
+
+
+config = read_config()
+
+logger = logging.getLogger("airflow.task")
+BQ_CONN_ID = config["hdl_source_connection_id"]
+function_ids=config["function_ids"]
+TD_CONN_ID = function_ids[random.randint(0,len(function_ids)-1)]
+BQ_PROJECT = config["hdl_source_project"]
+BQ_METADATA_TABLE = f"{BQ_PROJECT}.{config["Metadata_Dataset"]}.{config["Metadata_Tbl"]}"
+BQ_EVENT_METADATA_TABLE = f"{BQ_PROJECT}.{config["Event_Metadata_Dataset"]}.{config["Event_Metadata_Tbl"]}"
+BQ_AUDIT_TABLE = f"{BQ_PROJECT}.{config["Audit_Dataset"]}.{config["Audit_Table"]}"
+STATUS_VAR=[]
+
+def format_td_timestamp(ts_str):
+    if not ts_str: return None
+    # Replace 'T' with a space and take the first 19 characters: YYYY-MM-DD HH:MM:SS
+    return ts_str.replace('T', ' ').split('.')[0]
+
+def format_td_time(tm_str):
+    if not tm_str: return None
+    # Take HH:MM:SS only
+    return tm_str.split('.')[0]
+
+def task_status_callback(context):
+    ti = context['task_instance']
+    map_index = ti.map_index 
+    all_metadata = ti.xcom_pull(task_ids='bulk_audit_init') 
+    if not all_metadata or map_index >= len(all_metadata):
+        return   
+    conf = all_metadata[map_index]
+    run_id = context['run_id']
+    start_time_est = pendulum.instance(ti.start_date).in_timezone('EST').format('YYYY-MM-DD HH:mm:ss') if ti.start_date else None
+    end_time_est = pendulum.instance(ti.end_date).in_timezone('EST').format('YYYY-MM-DD HH:mm:ss') if ti.end_date else pendulum.now('EST').format('YYYY-MM-DD HH:mm:ss')
+    state = ti.state
+    status = "SUCCESS" if state == "success" else "FAILED" 
+    bq_count, td_count = None, None
+    if state == "success":
+        try:
+            counts = fetch_counts(conf.copy())
+            bq_count = counts.get('bq_count')
+            td_count = counts.get('td_count')
+            
+            if bq_count is not None and td_count is not None:
+                if int(bq_count) != int(td_count):
+                    status = "COUNT_MISMATCH"
+            else:
+                status = "COUNT_FETCH_FAILED"
+        except Exception as e:
+            logger.error(f"Count fetch failed for {conf.get('bq_table_name')}: {e}")
+            status = "COUNT_FETCH_FAILED"
+
+    result_payload = {
+        **conf,
+        "status": status,
+        "bq_count": bq_count,
+        "td_count": td_count,
+        "start_time": start_time_est,
+        "end_time": end_time_est
+    }
+    
+    ti.xcom_push(key="final_audit_record", value=result_payload)
+
+def fetch_counts(record: dict):
+    bq_hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID)
+    try:
+        bq_query = f"SELECT CAST(COUNT(*) AS BIGINT) AS cnt FROM `{record['bq_table_name']}`"
+        df = bq_hook.get_pandas_df(sql=bq_query, dialect="standard", location="US")
+        bq_count = int(df['cnt'][0])
+    except Exception as e:
+        logger.warning("Failed to fetch BQ count for %s: %s", record['bq_table_name'], e)
+        bq_count = None
+
+    try:
+        conn_info = BaseHook.get_connection(TD_CONN_ID)
+        with teradatasql.connect(
+            host=conn_info.host,
+            user=conn_info.login,
+            password=conn_info.password
+        ) as td_conn:
+            td_cursor = td_conn.cursor()
+            td_query = f"SELECT CAST(COUNT(*) as BIGINT) FROM {record['td_table_name']}"
+            td_cursor.execute(td_query)
+            td_count = int(td_cursor.fetchone()[0])
+            td_cursor.close()
+    except Exception as e:
+        logger.warning("Failed to fetch TD count for %s: %s", record['td_table_name'], e)
+        td_count = None
+
+    record.update({
+        'bq_count': bq_count,
+        'td_count': td_count,
+        'data_size_gb': record.get('bq_table_physical_size_gb', 'NA')
+    })
+
+    logger.info(
+        "Fetched counts for %s — BQ: %s | TD: %s | Size: %s GB",
+        record['bq_table_name'], bq_count, td_count, record['data_size_gb']
+    )
+    return record
+
+with DAG(
+    dag_id="dg_gk1v_edwdo_bq2td_priority_automatic_trigger_writeback_utility_old",
+    start_date=datetime(2024, 1, 1),
+    schedule_interval='10 * * * *',
+    max_active_runs=3,
+    max_active_tasks=50,
+    catchup=False,
+    description="Trigger writeback DAGs with BQ & Teradata counts and audit tracking",
+    params={
+        "bq_table_names": ""
+    }
+) as dag:
+
+    start = EmptyOperator(task_id="start")
+    end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.ALL_DONE)
+
+    @task
+    def fetch_metadata(**context):
+        conf = context.get("dag_run").conf or {}
+        hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID)
+        dag_id = context["dag"].dag_id
+        run_id = context["run_id"]
+        data_interval_start = context.get("data_interval_start")
+        data_interval_end = context.get("data_interval_end")
+        query=f"""
+        select * from (
+        select '' as processtypecode,feed_type as processname,case when status='Loaded' then 'C' else 'F' end as status, dw_insert_tms from AST.MARKETO_JOB_STATUS
+        union all 
+        select '',TableName,case when status='Success' then 'C' else 'F' end as status,dw_insert_tms from SOURCE_SCHEMA_03.MARKETO_PRCS_CTRL
+        union all
+        select prcs_type_code,prcs_name,prcs_stat_code,end_dttm from BODS_METADATA_VW.PRCS_CTRL
+        union all
+        select prcs_type_code,prcs_name,prcs_stat_code,end_dttm from EDW_METADATA_VW.PRCS_CTRL 
+        ) as fd where dw_insert_tms between '{data_interval_start.strftime('%Y-%m-%d %H:%M:%S')}' and '{data_interval_end.strftime('%Y-%m-%d %H:%M:%S')}' and status in ('C')
+        """
+        hook = TeradataHook(teradata_conn_id='teradata_default')
+        
+        conn = hook.get_conn()
+        
+        try:
+            print("Fetching data from Teradata...")
+            df = pd.read_sql(query, conn)
+            
+            print(f"Successfully retrieved {len(df)} rows.")
+            print("DataFrame Schema:")
+            print(df.dtypes)
+            print(df.head())
+            
+            
+        finally:
+            # Always close the connection
+            conn.close()
+        
+
+        logger.info("Fetching default metadata (FULL LOAD only)")
+        
+        print(query)
+           
+        df = hook.get_pandas_df(sql=query, dialect="standard", location="US")
+        for col in df.select_dtypes(include=['datetime64', 'datetimetz']).columns:
+            df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+        df_new=df
+        records = df.to_dict(orient='records')
+        
+        cols_to_remove = [
+            'gcp_project', 'process_name', 'sub_process', 'process_date', 
+            'application_id', 'target', 'tablename', 'SOR_ID', 
+            'LOAD_START_DT', 'LOAD_START_TM', 'LOAD_START_TIMESTAMP', 
+            'LOAD_COMPLETION_DT', 'LOAD_COMPLETION_TM', 'LOAD_COMPLETION_TIMESTAMP', 
+            'COMMENT_TEXT', 'INSTANCE_IND'
+        ]
+
+        df_cleaned = df_new.drop(columns=cols_to_remove, errors='ignore').drop_duplicates()
+        records_cleaned = df_cleaned.to_dict(orient='records')
+        
+        
+        airflow_var_payload = []
+
+        for _, row in df.iterrows():
+            if row.get("TABLENAME") and str(row["TABLENAME"]).strip() != "":
+                
+                airflow_var_payload.append([
+                    row["TABLENAME"],
+                    row["SOR_ID"],
+                    str(row["LOAD_START_DT"]) if row["LOAD_START_DT"] else None,
+                    str(row["LOAD_START_TM"]) if row["LOAD_START_TM"] else None,
+                    str(row["LOAD_START_TIMESTAMP"]) if row["LOAD_START_TIMESTAMP"] else None,
+                    str(row["LOAD_COMPLETION_DT"]) if row["LOAD_COMPLETION_DT"] else None,
+                    str(row["LOAD_COMPLETION_TM"]) if row["LOAD_COMPLETION_TM"] else None,
+                    str(row["LOAD_COMPLETION_TIMESTAMP"]) if row["LOAD_COMPLETION_TIMESTAMP"] else None,
+                    0,  # INSERT_CNT
+                    0,  # UPDATE_CNT
+                    0,  # DELETE_CNT
+                    0,  # ET_CNT
+                    0,  # UV_CNT
+                    row["COMMENT_TEXT"],
+                    row["INSTANCE_IND"]
+                ])
+            else:
+                logger.info(f"Skipping TABLE_LOAD_STATUS payload for {row['bq_table_name']} because ts metadata is NULL.")
+
+        if not records:
+            logger.warning("No matching metadata found for query: %s", query)
+        else:
+            logger.info("Fetched %d metadata records", len(records))
+            if airflow_var_payload:
+                Variable.set(
+                    key=f"bq_prt_writeback_metadata{run_id}",
+                    value=json.dumps(airflow_var_payload)
+                )
+                logger.info(f"Saved {len(airflow_var_payload)} records to Airflow Variable for TD status update.")
+            else:
+                logger.warning("No records matched the 'ts' criteria; Airflow Variable not updated/cleared.")
+        return records_cleaned
+
+    
+
+    @task
+    def bulk_audit_init(metadata_list: list, **context):
+        """Task 1: One-time bulk entry for all tables as RUNNING"""
+        if not metadata_list:
+            return
+        
+        hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID)
+        execution_date = context['execution_date']
+        exec_hour = execution_date.strftime('%H:00')
+        start_time_str = pendulum.now('EST').format('YYYY-MM-DD HH:mm:ss')
+        
+        # Build a single multi-row INSERT query for efficiency
+        values_list = []
+        for record in metadata_list:
+            values_list.append(f"""(
+                '{record['bq_table_name']}', '{record['td_table_name']}', '{exec_hour}', 'RUNNING', 
+                '{record.get('bq_table_logical_size_gb', '')}', '{record.get('table_loaded_by_dag', '')}', 
+                '{record.get('composer_instance', '')}', '{record['writeback_dag_name']}', 
+                '{record.get('load_type', '')}', '{record.get('load_functionality', '')}', 
+                CURRENT_TIMESTAMP(), '{start_time_str}', '{record['storage_last_modified_time']}', 'framework_triggered'
+            )""")
+        
+        insert_query = f"""
+            INSERT INTO `{BQ_AUDIT_TABLE}` 
+            (bq_table_name, td_table_name, execution_hour, writeback_status, data_size_gb, functional_id, composer_instance, writeback_dag_name, load_type, load_functionality, audit_ts, start_time, table_last_modified_when_wb, trigger_type) 
+            VALUES {", ".join(values_list)}
+        """
+        hook.run_query(sql=insert_query, use_legacy_sql=False)
+        return metadata_list
+    
+
+    metadata_records = fetch_metadata()
+
+    # 2. Initial Audit Entry
+    init_audit_data = bulk_audit_init(metadata_records)
+
+    trigger_worker = TriggerDagRunOperator.partial(
+        task_id="trigger_dag",
+        wait_for_completion=True,
+        deferrable=True, 
+        poke_interval=60,
+        on_success_callback=task_status_callback,
+        on_failure_callback=task_status_callback,
+        execution_timeout=timedelta(hours=6),
+        retries=0
+    ).expand_kwargs(
+        init_audit_data.map(lambda x: {
+            "trigger_dag_id": x["writeback_dag_name"], 
+            "conf": x,
+            "task_id": f"trigger_{x['bq_table_name'].replace('.', '_')}"
+        })
+    )
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def bulk_audit_finalize(**context):
+        ti = context['ti']
+        # 1. PULL ALL UNIQUE RECORDS for this execution
+        all_results = ti.xcom_pull(
+            task_ids='trigger_dag', 
+            key='final_audit_record',
+            map_indexes=None 
+        )
+        if not all_results:
+            logger.warning("No unique audit records found in XCom.")
+            return
+
+        # Filter out None values just in case
+        valid_results = [r for r in all_results if r is not None]
+
+        # 3. BigQuery Bulk Insert (Push everything at once)
+        values_list = []
+        for res in valid_results:
+            bq_cnt = f"'{res['bq_count']}'" if res['bq_count'] is not None else "NULL"
+            td_cnt = f"'{res['td_count']}'" if res['td_count'] is not None else "NULL"
+            
+            values_list.append(f"""(
+                '{res['bq_table_name']}', '{res['td_table_name']}', '{res['status']}', 
+                {bq_cnt}, {td_cnt}, CURRENT_TIMESTAMP(), '{res['end_time']}', 
+                '{res.get('start_time', '')}', 'framework_triggered','{res['writeback_dag_name']}','{res['bq_table_logical_size_gb']}','{res['load_type']}','{res['load_functionality']}'
+            )""")
+
+        if values_list:
+            bulk_sql = f"""
+                INSERT INTO `{BQ_AUDIT_TABLE}` 
+                (bq_table_name, td_table_name, writeback_status, bq_count, td_count, 
+                audit_ts, end_time, start_time, trigger_type,writeback_dag_name,data_size_gb,load_type,load_functionality) 
+                VALUES {", ".join(values_list)}
+            """
+            BigQueryHook(gcp_conn_id=BQ_CONN_ID).run_query(sql=bulk_sql, use_legacy_sql=False)
+            logger.info(f"Bulk insert complete: {len(values_list)} records processed.")
+    mapped_results = bulk_audit_finalize()
+
+    start >> metadata_records >> init_audit_data >> trigger_worker >> mapped_results  >> end

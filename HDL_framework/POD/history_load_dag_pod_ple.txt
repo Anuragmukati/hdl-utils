@@ -1,0 +1,865 @@
+import json
+from datetime import datetime,timedelta
+import sys
+import pandas as pd
+import time
+from airflow import DAG
+from airflow.operators.python import PythonOperator,BranchPythonOperator
+from airflow.sensors.time_delta import TimeDeltaSensorAsync
+from airflow.operators.empty import EmptyOperator
+from airflow.exceptions import AirflowFailException,AirflowSkipException
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from google.cloud.exceptions import NotFound
+from airflow.utils.email import send_email
+import traceback
+import numpy as np
+
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_25/"
+sys.path.append(f"{BASE_DIR}/")
+
+def read_config():
+    with open('/home/airflow/gcs/dags/PROJECT_ID_25/history_load_config_wave_hdl.json', 'r') as f:
+        confid_details = json.load(f)
+    return confid_details
+
+
+
+config = read_config()
+
+# gcs details
+
+Audit_db=config["Audit_Dataset"]
+Metadata_db=config["Metadata_Dataset"]
+Metadata_tbl=config["Metadata_Tbl"]
+Audit_tbl=config["Audit_Table"]
+Queue_Table=config["Queue_Table_large"]
+Queue_Table_TPT=config["Queue_Table_large"].replace("nos","tpt")
+HDL_project=config["hdl_source_project"]
+hdl_source_connection_id=config["hdl_source_connection_id"]
+large_table_size=1100
+instances_cfg_tbl=f"{config['hdl_source_project']}.{config['Metadata_Dataset']}.{config.get('instances_config_tbl','hdl_project_instances_config')}"
+
+
+def extract_metadata(table_id):
+    sql = f"""select is_table_active,table_uid,src_schema,src_table,stg_schema,stg_table,tgt_schema,tgt_table,load_type,delta_column,delta_column_type,delta_column_format,delta_interval,app_name,src_table_size,src_table_row_count,src_table_type,bus_key_column,change_value_column,start_date_column,end_date_column,stg_load_enabled,plican_validation_enabled,select_query,load_functionality,select_query_tpt from `{HDL_project}.{Metadata_db}.{Metadata_tbl}`
+    where  is_table_active=True and concat(tgt_schema,'.',tgt_table)='{table_id}' limit 1;"""
+    print(f"**** Metadata select query: \n {sql}")
+
+    hook = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    cursor.execute(sql)
+    row = cursor.fetchone()
+
+    print(f"**** Total metadata table rows fetched: {len(row)}")
+    table_info = {}
+    table_info['tgt_schema'] = row[6]
+    table_info['tgt_table'] = row[7]
+    table_info['delta_column'] = row[9]
+    return table_info
+
+def check_if_first_run(table_id):
+    metadata = extract_metadata(table_id)
+    last_val = get_delta_max_value(metadata['tgt_schema'],metadata['tgt_table'])
+    print(f"***** Delta column Max value: {last_val}")
+
+    if last_val:
+        return 0
+    elif last_val is None:
+        print(f"***** Max value not found for delta column:{metadata.get('delta_column')} , table:{table_id}")
+        return 1
+    else:
+        -1
+
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 4, 9),
+    'retries': 0
+}
+
+dag = DAG(
+    dag_id='history_load_dag_pod_ple',
+    default_args=default_args,
+    description='DAG to Load History Data to BQ PLE',
+    schedule_interval=None,
+    max_active_runs=4,
+    catchup=False,
+    params={
+        # Source Teradata table names — one entry per table, must match BQ_Table_list and App_Name in order.
+        "TD_Table_list": ["td_db_name.td_table_name_1", "td_db_name.td_table_name_2"],
+
+        # Target BigQuery table names in "dataset.table" format.
+        # Must be the same length as TD_Table_list and App_Name.
+        "BQ_Table_list": ["SOURCE_SCHEMA_01.table_name_1", "SOURCE_SCHEMA_01.table_name_2"],
+
+        # Application name per table — same order as the lists above.
+        # Valid pattern: <project>_PLE_Full
+        # Replace <project> with your actual project prefix (e.g. Zdwv, Cwls — contact HDL team to confirm)
+        "App_Name": ["<project>_PLE_Full", "<project>_PLE_Full"],
+
+        # Comma-separated recipient email addresses for pre-load and final load reports.
+        # HDL team is always CC'd automatically — you only need to add your own address(es).
+        "Email_id": "user@example.com",
+    }
+)
+
+def queue_counter(queue_counts, table_name,non_of_instacnes):
+    qnum = queue_counts[table_name]
+    queue_counts[table_name] = qnum+1 if qnum < non_of_instacnes else 1
+    return qnum,queue_counts
+
+
+def get_delta_max_value(schema,table_name):
+    query=f"""SELECT delta_column_max_value FROM `{HDL_project}`.{Audit_db}.{Audit_tbl}  WHERE concat(tgt_schema,'.',tgt_table) ='{schema}.{table_name}' and app_name='NOS_First'  AND Job_STATUS = 'SUCCESS' order by end_time desc"""
+
+    print(f"**** get max value query: {query}")
+    hook = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        return rows[0][0] if rows and rows[0][0] is not None else None
+    except Exception as e:
+        print(f"Error while fetching running tasks")
+        print(f"Error: ",str(e))
+        print(f"Traceback: ",traceback.format_exc())
+        return -1
+
+def check_table_exists(BQ_Table_list,GCP_CONN_DO_ID_TBL,GCP_PROJECT_ID):
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID_TBL, use_legacy_sql=False)
+    client=hook.get_client()
+    tbl_fl_nm=f'{GCP_PROJECT_ID}.{BQ_Table_list}'
+    try:
+        client.get_table(tbl_fl_nm)
+        print(f"Table is exists:{tbl_fl_nm}")
+        return "True"
+    except Exception as e:
+        print(f"Table is not exists:{tbl_fl_nm}")
+        return "False"
+
+def prod_to_ple(db_nm,tbl_nm,bq_ple_project,bq_prod_project,GCP_CONN_DO_ID_PLE):
+    sql=f"TRUNCATE TABLE {bq_ple_project}.{db_nm}.{tbl_nm}; INSERT INTO {bq_ple_project}.{db_nm}.{tbl_nm} SELECT * FROM {bq_prod_project}.{db_nm}.{tbl_nm}"
+    hook = BigQueryHook(gcp_conn_id=GCP_CONN_DO_ID_PLE, use_legacy_sql=False)
+    conn = hook.get_conn()
+    cursor = conn.cursor()
+    try:
+        print(sql)
+        cursor.execute(sql)
+        return 1
+    except Exception as e:
+        print('PROD TO PLE got failed!!!!!')
+        return -1
+
+def Queue_Table_List(**kwargs):
+    TD_Table_list=kwargs['dag_run'].conf.get('TD_Table_list',[])
+    BQ_Table_list=kwargs['dag_run'].conf.get('BQ_Table_list',[])
+    App_Name=kwargs['dag_run'].conf.get('App_Name',[])
+    Email_id=kwargs['dag_run'].conf.get('Email_id','')
+    dag_run_id=kwargs['dag_run'].run_id
+    dag_id = kwargs['dag'].dag_id
+    if '+' in dag_run_id:
+        dag_run_id=str(str(dag_id)+'_'+str("-".join(str(dag_run_id.split('_')[2]).split('+')[:-1])))
+    else:
+        dag_run_id=str(str(dag_id)+'_'+str("-".join(str(dag_run_id.split('_')[2]).split('-')[:-1])))
+    print(App_Name)
+    App_Name=['Gk1vdo' if str(x)=='NOS_First' else x for x in App_Name]
+    df=pd.DataFrame({
+        "TD_table":TD_Table_list,
+        "BQ_Table":BQ_Table_list,
+        "App_Name":App_Name
+    })
+
+    print(TD_Table_list)
+    print(BQ_Table_list)
+    print(App_Name)
+    df['run_id']=dag_run_id
+    df['prod_to_ple']=0
+    df['Prod_Load_flag']=False
+    df['Ple_Load_flag']=True
+    if len(TD_Table_list) == len(BQ_Table_list) == len(App_Name) ==0:
+        print("Config have No Value marking dag as successful")
+        raise AirflowSkipException("Dag got skipped because of no data provided")
+
+    elif len(TD_Table_list) == len(BQ_Table_list) == len(App_Name):
+
+        queue_counts = {
+        "nos_queue_table_small" : 1,
+        "tpt_queue_table_fullLoad" : 1
+        }
+
+        # Load instances config from BQ table
+        inst_hook   = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+        inst_cursor = inst_hook.get_conn().cursor()
+        inst_cursor.execute(f"SELECT prj, num_instances FROM `{instances_cfg_tbl}`")
+        instances_map   = {row[0]: row[1] for row in inst_cursor.fetchall()}
+        valid_app_names = [f"{prj.capitalize()}_PLE_Full" for prj in instances_map]
+        print(f"Valid app names loaded from BQ config (PLE only): {valid_app_names}")
+
+        for i in range(len(TD_Table_list)):
+            df.loc[i,'large_table_size']='False'
+            df.loc[i, 'is_view']= 'False'
+            if App_Name[i] in valid_app_names:
+                prj_lower = str(str(App_Name[i]).split('_')[0]).lower()
+                GCP_PROJECT_ID=config[f"bq_ple_project_{prj_lower}"]
+                GCP_PROJECT_ID_PROD=config[f"bq_prod_project_{prj_lower}"]
+                GCP_CONN_DO_ID_TBL=config[f"GCP_CONN_DO_ID_{prj_lower}"]
+                no_of_instances=instances_map.get(prj_lower, 1)
+            else:
+                print("###############################")
+                print("##### App_Name is Wrong #######")
+                print("###############################")
+                df.loc[i,'queue_table_status']='False'
+                df.loc[i,'Metadata_available']='False'
+                continue
+
+            if not GCP_PROJECT_ID or not GCP_CONN_DO_ID_TBL:
+                GCP_CONN_DO_ID_TBL='sa-PROJECT_ID_28'
+                GCP_PROJECT_ID_PROD='PROJECT_ID_30'
+                GCP_PROJECT_ID='PROJECT_ID_31'
+                no_of_instances=1
+
+            table_creation=check_table_exists(BQ_Table_list[i],GCP_CONN_DO_ID_TBL,GCP_PROJECT_ID_PROD)
+            df.loc[i,'table_creation']=table_creation
+            df.loc[i,'queue_table_status']=table_creation
+            db_nm=str(BQ_Table_list[i]).split('.')[0]
+            tbl_nm=str(BQ_Table_list[i]).split('.')[1]
+            app_nm=App_Name[i]
+            print(db_nm,tbl_nm,app_nm)
+            if table_creation:
+                hook = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+                conn = hook.get_conn()
+                cursor = conn.cursor()
+                metadata_tbl_sql=f"select src_table_type,load_type,src_table_size,spool_flag,prod_to_ple from {HDL_project}.{Metadata_db}.{Metadata_tbl} where tgt_schema='{db_nm}' and tgt_table='{tbl_nm}' and app_name ='{app_nm}'"
+                try:
+                    cursor.execute(metadata_tbl_sql)
+                except Exception as e:
+                    print(metadata_tbl_sql)
+                    print('##################################################')
+                    print("Metadata Table Query Got Failed")
+                    print('##################################################')
+                    raise AirflowFailException(f"Reason: {e}")
+                result=cursor.fetchone()
+                if result or result is not None:
+                    df.loc[i,'Metadata_available']="True"
+                    src_table_type = result[0]
+                    load_type = result[1]
+                    spool_flag=result[3]
+                    prod_to_ple_flag=result[4]
+                    try:
+                        src_table_size = int("".join(filter(str.isdigit, result[2])))
+                    except Exception as e:
+                        print('##################################################################')
+                        print("Cannot fetch source data size. Source table specified is a view")
+                        print('##################################################################')
+                        df.loc[i,'queue_table_status']='False'
+                        df.loc[i,'table_creation']='False'
+                        df.loc[i, 'is_view']= 'True'
+                        continue
+                    print("src_table_type: ",src_table_type)
+                    print("load_type: ",load_type)
+                    df.loc[i,"Table_Size_Gb"]=src_table_size
+                    if prod_to_ple_flag is True:
+                        print("Data copying from BQ Prod to BQ Ple")
+                        df.loc[i,'prod_to_ple']=prod_to_ple(db_nm,tbl_nm,GCP_PROJECT_ID,GCP_PROJECT_ID_PROD,GCP_CONN_DO_ID_TBL)
+                        df.loc[i,'Loading_Source']='BQ Prod To PLE'
+                        df.loc[i,'queue_table_status']='False'
+                        df.loc[i,'Large_table_status']='False'
+                        continue
+                    df.loc[i,'Loading_Source']='TD Prod To BQ PLE'
+                    if src_table_size >int(large_table_size):
+                            df.loc[i,'Large_table_status']='True'
+                            df.loc[i,'queue_table_status']='False'
+                    else:
+                        df.loc[i,'Large_table_status']='False'
+
+                        if load_type.upper().strip() == "FULLLOAD":
+                            qnum,queue_counts = queue_counter(queue_counts,f'{Queue_Table}_small',no_of_instances)
+                            if spool_flag == 0:
+                                queue_tbl_sql=f"insert into {HDL_project}.{Metadata_db}.{Queue_Table}_small (table_uid,table_dataset,table_name,app_name,ple_load,prod_load,dag_run_id,queue_number) values('{db_nm}__{tbl_nm}','{db_nm}','{tbl_nm}','{App_Name[i]}',True,False,'{dag_run_id}', '{qnum}')"
+                                print(f"Table Loading using NOS CSV: {db_nm}.{tbl_nm}")
+                            else:
+                                queue_tbl_sql=f"insert into {HDL_project}.{Metadata_db}.{Queue_Table}_small_p (table_uid,table_dataset,table_name,app_name,ple_load,prod_load,dag_run_id,queue_number) values('{db_nm}__{tbl_nm}','{db_nm}','{tbl_nm}','{App_Name[i]}',True,False,'{dag_run_id}', '{qnum}')"
+                                print(f"Table Loading using NOS Parquet: {db_nm}.{tbl_nm}")
+                        elif load_type.upper().strip() in ['Append','Append_Delete']:
+                            print('##################################################')
+                            print(f'Not Support load Type by this Dag. Use Adhoc Dag')
+                            print('##################################################')
+                            df.loc[i,'queue_table_status']='False'
+                            continue
+                        else:
+                            print('##################################################')
+                            print(f'Invalid Load Type specified for table: {db_nm}.{tbl_nm}')
+                            print('##################################################')
+                            df.loc[i,'queue_table_status']='False'
+                            continue
+                        try:
+                            cursor.execute(queue_tbl_sql)
+                            df.loc[i,'queue_table_status']='True'
+                        except:
+                            print(queue_tbl_sql)
+                            print('##################################################')
+                            print("Queue Table Query Got Failed")
+                            print('##################################################')
+                            raise AirflowFailException("Queue Table Query Got Failed")
+                else:
+                    print('##################################################')
+                    print("No Metadata found",BQ_Table_list[i])
+                    print('##################################################')
+                    df.loc[i,'Metadata_available']="False"
+                    df.loc[i,'queue_table_status']='False'
+                    df.loc[i,'Large_table_status']='False'
+                    continue
+            else:
+                df.loc[i,'queue_table_status']='False'
+                print('##################################################')
+                print("Table is not created in Prod. Please create the table ",BQ_Table_list[i])
+                print('##################################################')
+                continue
+    else:
+        print("Please send the all details the count of provided config is not matching")
+        raise AirflowFailException("count of provided config is not matching")
+    ti=kwargs['ti']
+    ti.xcom_push(key='tbl_dtl', value=df.to_dict())
+    ti.xcom_push(key='Email_id', value=Email_id)
+    send_first_email(**kwargs)
+
+def send_first_email(**kwargs):
+    ti = kwargs['ti']
+    ddf = pd.DataFrame(ti.xcom_pull(task_ids='Queue_Table_Preperation', key='tbl_dtl'))
+    email_id = ti.xcom_pull(task_ids='Queue_Table_Preperation', key='Email_id') or ""
+
+    # Recipients
+    recipient_email = email_id + ",user@example.com,user@example.com"
+    recipient_emails = [email.strip() for email in recipient_email.split(',')]
+    subject = "HDL PreLoad Report"
+
+    print("sending email report of table load")
+
+    # Convert "True"/"False" strings to booleans
+    ddf['Metadata_available'] = ddf['Metadata_available'].str.lower() == 'true'
+    ddf['queue_table_status'] = ddf['queue_table_status'].str.lower() == 'true'
+    ddf['Large_table_status'] = ddf['Large_table_status'].str.lower() == 'true'
+    ddf['is_view']= ddf['is_view'].str.lower() == 'true'
+
+    # Distinct app names where metadata is available (with NOS_First -> Gk1vdo mapping for display)
+    distinct_app_name = ddf.loc[ddf['Metadata_available'], 'App_Name'].dropna().unique().tolist()
+    dag_name = ''
+    for appnm in distinct_app_name:
+        display_name = str(str(appnm).split('_')[0]).lower()
+        env = str(str(appnm).split('_')[1]).lower()
+        dag_name += (
+            f"<div style='margin:6px 0 12px 0;'>For <b>{display_name}</b> use "
+            f"<code>history_load_dag_nos_parquet_adhoc_{display_name.lower()}_{env.lower()} on dts 4 composer</code></div>"
+        )
+
+    # Filtered DataFrames
+    meta_missing_df = ddf[~ddf['Metadata_available']][['BQ_Table', 'TD_table', 'App_Name']].reset_index(drop=True)
+    large_tables_df = ddf[ddf['Large_table_status']][['BQ_Table', 'TD_table', 'App_Name', 'Table_Size_Gb']].reset_index(drop=True)
+    prod_to_ple_df = ddf[ddf['prod_to_ple']==1][['BQ_Table', 'TD_table', 'App_Name', 'Table_Size_Gb']].reset_index(drop=True)
+    views_found = ddf[ddf['is_view']][['BQ_Table', 'TD_table', 'App_Name']].reset_index(drop=True)
+
+    # Summary counts
+    total_tables = len(ddf)
+    to_be_loaded = int(ddf['queue_table_status'].sum())
+    meta_missing_count = len(meta_missing_df)
+    large_count = len(large_tables_df)
+    prod_to_ple_cnt=len(prod_to_ple_df)
+    sql=f"select count(*) as cnt from {HDL_project}.{Audit_db}.{Audit_tbl} where dag_run_id='{str(ddf['run_id'].iloc[0])}' and job_status!='STARTED'"
+    realtime_sql=f"select job_status,count(*) from {HDL_project}.{Audit_db}_nogsam_v.{Audit_tbl} where dag_run_id='{str(ddf['run_id'].iloc[0])}' and job_status!='STARTED' group by 1 order by 1 desc"
+    view_count = len(views_found)
+
+
+    # Table 1: Summary
+    summary_html = f"""
+    <h2>Table Summary</h2>
+    <table style='width:25%;height:50px'>
+    <tr style='background-color:#88CEEB'><td style="font-weight:bold;">Metric</td><td style="font-weight:bold;">Value</td></tr>
+    <tr><td>Total Tables Passed</td><td>{total_tables}</td></tr>
+    <tr><td>Tables to be Loaded</td><td>{to_be_loaded}</td></tr>
+    <tr><td>Metadata Missing</td><td>{meta_missing_count}</td></tr>
+    <tr><td>Large Tables</td><td>{large_count}</td></tr>
+    <tr><td>Prod to Ple Copy</td><td>{prod_to_ple_cnt}</td></tr>
+    </table>
+    """
+
+    # If both lists are empty → only summary
+    if meta_missing_count == 0 and large_count == 0 and view_count == 0:
+        html_content = f"""
+        <html>
+        <style>
+    body {{
+        font-family: Arial, sans-serif;
+    }}
+    table {{
+        border-collapse: collapse;
+        width: 100%;
+        margin-bottom: 20px;
+    }}
+    th {{
+        border: 2px solid #000000;
+        background-color: #b3d9ff;
+        padding: 10px;
+        text-align: center;
+    }}
+    td {{
+        border: 1px solid #999999;
+        padding: 10px;
+        text-align: center;
+    }}
+    .summary-table th, .summary-table td {{
+        border: 1px solid #666666;
+    }}
+</style>
+        <body>
+            <h1 style='text-align: center;'>HDL Preload Alert For {ddf['run_id'].iloc[0]}</h1>
+            {summary_html}
+            <h2>Real-Time Load Status</h2>
+            <p>For real-time update, run this query on BigQuery:</p>
+            <pre style='background:#f4f4f4;padding:10px;border-left:4px solid #2196F3;font-size:13px;white-space:pre-wrap;'>{realtime_sql}</pre>
+        </body>
+        </html>
+        """
+    else:
+        # Table 2: Metadata Missing
+        meta_missing_html = """
+        <h3 style='text-align: center;'>Metadata Missing</h3>
+        <table style='width:100%'>
+        <tr style='background-color:#88CEEB'>
+            <th>Sr. No.</th>
+            <th>BQ TBL NM</th>
+            <th>TD TBL NM</th>
+            <th>APP NAME</th>
+        </tr>
+        """
+        for i, row in meta_missing_df.iterrows():
+            meta_missing_html += f"""
+            <tr>
+            <td style='text-align: center;'>{i+1}</td>
+            <td style='text-align: center;'>{row['BQ_Table']}</td>
+            <td style='text-align: center;'>{row['TD_table']}</td>
+            <td style='text-align: center;'>{row['App_Name']}</td>
+            </tr>
+            """
+        if meta_missing_df.empty:
+            meta_missing_html += "<tr><td colspan='4'>None</td></tr>"
+        meta_missing_html += "</table>"
+
+        # Table 3: Large Tables
+        large_tables_html = """
+        <h3 style='text-align: center;'>Large Tables</h3>
+        <table style='width:100%'>
+        <tr style='background-color:#88CEEB'>
+            <th>Sr. No.</th>
+            <th>BQ TBL NM</th>
+            <th>TD TBL NM</th>
+            <th>APP NAME</th>
+            <th>TABLE SIZE (GB)</th>
+        </tr>
+        """
+        for i, row in large_tables_df.iterrows():
+            size_val = row['Table_Size_Gb']
+            large_tables_html += f"""
+            <tr>
+            <td style='text-align: center;'>{i+1}</td>
+            <td style='text-align: center;'>{row['BQ_Table']}</td>
+            <td style='text-align: center;'>{row['TD_table']}</td>
+            <td>{row['App_Name']}</td>
+            <td>{size_val}</td>
+            </tr>
+            """
+        if large_tables_df.empty:
+            large_tables_html += "<tr><td colspan='5'>None</td></tr>"
+        large_tables_html += "</table>"
+
+        # Table 4: Views Found
+        views_found_html = """
+        <h3 style='text-align: center;'>Views Found</h3>
+        <table style='width:100%'>
+        <tr style='background-color:#88CEEB'>
+            <th>Sr. No.</th>
+            <th>BQ TBL NM</th>
+            <th>TD TBL NM</th>
+            <th>APP NAME</th>
+        </tr>
+        """
+        for i, row in views_found.iterrows():
+            views_found_html += f"""
+            <tr>
+            <td style='text-align: center;'>{i+1}</td>
+            <td style='text-align: center;'>{row['BQ_Table']}</td>
+            <td style='text-align: center;'>{row['TD_table']}</td>
+            <td style='text-align: center;'>{row['App_Name']}</td>
+            </tr>
+            """
+        if views_found.empty:
+            views_found_html += "<tr><td colspan='4'>None</td></tr>"
+        views_found_html += "</table>"
+
+
+        # Action Items
+        notes = []
+        if large_count > 0:
+            notes.append(f"""<li><b>Large tables:</b> please use the other DAGs Mentioned below with Where Condition.<div>{dag_name}</div></li><li>Example of Configuration to trigger the Dag {{"BQ_Table": "SOURCE_SCHEMA_01.daily_acct_activity_v2",
+            "Condition": " where trans_dt = '2025-08-03'",
+            "tbl_load_type": "FullLoad or Append"}}</li>""")
+        if meta_missing_count > 0:
+            notes.append("<li><b>Metadata missing:</b> Please reach out to HDL Team on <b>user@example.com</b>.</li>")
+        notes_html = f"<h2>Action Items</h2><div>{'<br>'.join(notes)}</div>"
+
+        # Final HTML
+        html_content = f"""
+        <html>
+        <style>
+    body {{
+        font-family: Arial, sans-serif;
+    }}
+    table {{
+        border-collapse: collapse;
+        width: 100%;
+        margin-bottom: 20px;
+    }}
+    th {{
+        border: 2px solid #000000;
+        background-color: #b3d9ff;
+        padding: 10px;
+        text-align: center;
+    }}
+    td {{
+        border: 1px solid #999999;
+        padding: 10px;
+        text-align: center;
+    }}
+    .summary-table th, .summary-table td {{
+        border: 1px solid #666666;
+    }}
+</style>
+        <body>
+            <h1>HDL Preload Alert</h1>
+            {summary_html}
+            {notes_html}
+            {meta_missing_html}
+            {large_tables_html}
+            {views_found_html}
+            <h2>Real-Time Load Status</h2>
+            <p>For real-time update, run this query on BigQuery:</p>
+            <pre style='background:#f4f4f4;padding:10px;border-left:4px solid #2196F3;font-size:13px;white-space:pre-wrap;'>{realtime_sql}</pre>
+        </body>
+        </html>
+        """
+
+    print(html_content)
+    send_email(to=recipient_emails, subject=subject, html_content=html_content)
+    print("Email sent successfully.")
+
+
+
+def Get_Table_Loading_Status(**kwargs):
+    ti=kwargs['ti']
+    tbl_dtl=ti.xcom_pull(task_ids='Queue_Table_Preperation', key='tbl_dtl')
+    df=pd.DataFrame(tbl_dtl)
+    table_list=("'"+df['BQ_Table'].astype(str)+df['App_Name'].astype(str)+"'").to_list()
+    tables_str=",".join(table_list)
+    for col in ['table_creation','Metadata_available','queue_table_status']:
+        df[col]=df[col].astype(str).str.strip().str.lower().map({'true':True,'false':False})
+    count_true=df[(df['queue_table_status'])].shape[0]
+    ple_cnt=df[(df['prod_to_ple']==1)].shape[0]
+    disnt_app_name=df['App_Name'].unique()
+    app_names=', '.join(f"'{val}'" for val in disnt_app_name)
+    if count_true == 0 and ple_cnt>0:
+        df['job_status']='Failed'
+        df['job_status'] = np.where(df['prod_to_ple'] == 1, 'success', np.where(df['prod_to_ple'] == -1, 'Dag_Failed', df['job_status']))
+        df['TD_Row_Count']='0'
+        df['BQ_Row_Count']='0'
+        df['Time_Taken']='0'
+        ti.xcom_push(key='tbl_load_dtl', value=df.to_dict())
+    elif count_true == 0 and ple_cnt==0:
+        print("No Table to load")
+        df['job_status']='Failed'
+        df['TD_Row_Count']='0'
+        df['BQ_Row_Count']='0'
+        df['Time_Taken']='0'
+        ti.xcom_push(key='tbl_load_dtl', value=df.to_dict())
+    else:
+        audit_tbl_sql=f"select count(*) as cnt from {HDL_project}.{Audit_db}.{Audit_tbl} where dag_run_id='{str(df['run_id'].iloc[0])}' and job_status!='STARTED'"
+        print(audit_tbl_sql)
+        time.sleep(150)
+        hook = BigQueryHook(gcp_conn_id=hdl_source_connection_id, use_legacy_sql=False)
+        conn = hook.get_conn()
+        cursor = conn.cursor()
+        
+        queue_tbl_sql=f"""select 'nos_queue_table_small' as queue_table_name,count(*) from {HDL_project}.{Metadata_db}.nos_queue_table_small where insert_dt<(select ifnull(min(insert_dt),'1001-01-01T00:00:00') from {HDL_project}.{Metadata_db}.nos_queue_table_small where dag_run_id='{str(df['run_id'].iloc[0])}' and app_name in ({app_names}) ) union all select 'tpt_queue_table_fullload' as queue_table_name,count(*) from {HDL_project}.{Metadata_db}.tpt_queue_table_fullload where insert_dt<(select ifnull(min(insert_dt),'1001-01-01T00:00:00') from {HDL_project}.{Metadata_db}.tpt_queue_table_fullload where dag_run_id='{str(df['run_id'].iloc[0])}' and app_name in ({app_names}) )"""
+        counter=0
+        
+        while True:
+            counter+=1
+            try:
+                cursor.execute(audit_tbl_sql)
+            except Exception as e:
+                print("Audit Table Query Got Failed",e)
+                raise AirflowFailException("Audit Table Query Got Failed")
+            load_status=cursor.fetchone()
+            try:
+                cursor.execute(queue_tbl_sql)
+            except Exception as e:
+                print("Queue table Query Got Failed",e)
+                raise AirflowFailException("Queue Table Query Got Failed")
+            queue_status=cursor.fetchall()
+            print("Number of pending tables in queue before your ones")
+            print(queue_status)
+            table_cnt=load_status[0]
+            print("Total Table Send for Load:",count_true)
+            print("Total Table Load Status Got:",table_cnt)
+            if table_cnt < count_true:
+                if counter/5==100:
+                    print("###############Time Out############")
+                    print("Caution: Not All table got loaded......")
+                    break
+                if counter%30==0:
+                    load_status_sql=f"select concat(tgt_schema,'.',tgt_table) as db_tbl_nm, job_status,src_row_count as TD_Row_Count,tgt_row_count as BQ_Row_Count,timestamp_diff(end_time,start_time,minute) as Time_Taken,App_Name as app_nm from {HDL_project}.{Audit_db}.{Audit_tbl} where dag_run_id='{str(df['run_id'].iloc[0])}' and job_status!='STARTED' and concat(tgt_schema,'.',tgt_table,app_name) in ({tables_str})"
+                    try:
+                        cursor.execute(load_status_sql)
+                    except:
+                        print("load_status_sql Failed")
+                    all_table_load_status=cursor.fetchall()
+                    column=[field[0] for field in cursor.description]
+                    bq_df=pd.DataFrame(all_table_load_status,columns=column)
+                    merged_df=df.merge(
+                        bq_df,
+                        how="left",
+                        left_on=['BQ_Table','App_Name'],
+                        right_on=['db_tbl_nm','app_nm']
+                    )
+                    merged_df['job_status']=merged_df['job_status'].fillna('Running')
+                    merged_df['job_status'] = np.where(merged_df['prod_to_ple'] == 1, 'success', np.where(merged_df['prod_to_ple'] == -1, 'Dag_Failed', merged_df['job_status']))
+                    merged_df['TD_Row_Count']=merged_df['TD_Row_Count'].fillna('0')
+                    merged_df['BQ_Row_Count']=merged_df['BQ_Row_Count'].fillna('0')
+                    merged_df['Time_Taken']=merged_df['Time_Taken'].fillna('0')
+                    merged_df=merged_df.drop(columns=['db_tbl_nm','app_nm'])
+                    if count_true==len(df):
+                        print("all table done")
+                    else:
+                        print("##########################################")
+                        print("Following tables are not created in BQ PLE")
+                        print(df[df['table_creation'] == "False"]['BQ_Table'].tolist())
+                        print("##########################################")
+                    print("Table Status")
+                    print("\n",merged_df.to_string(index=False))
+                    ti.xcom_push(key='tbl_load_dtl', value=merged_df.to_dict())
+                    send_report_email(**kwargs)
+                    print(f"Sent report after {int(counter/30) * int(75)} min")
+                time.sleep(150)
+                print("waiting to complete the tables",str(int(count_true)-int(table_cnt)))
+            else:
+                break
+        load_status_sql=f"select concat(tgt_schema,'.',tgt_table) as db_tbl_nm, job_status,src_row_count as TD_Row_Count,tgt_row_count as BQ_Row_Count,timestamp_diff(end_time,start_time,minute) as Time_Taken,App_Name as app_nm from {HDL_project}.{Audit_db}.{Audit_tbl} where dag_run_id='{str(df['run_id'].iloc[0])}' and job_status!='STARTED' and concat(tgt_schema,'.',tgt_table,app_name) in ({tables_str})"
+        try:
+            cursor.execute(load_status_sql)
+        except:
+            print("load_status_sql Failed")
+        all_table_load_status=cursor.fetchall()
+        column=[field[0] for field in cursor.description]
+        bq_df=pd.DataFrame(all_table_load_status,columns=column)
+        merged_df=df.merge(
+            bq_df,
+            how="left",
+            left_on=['BQ_Table','App_Name'],
+            right_on=['db_tbl_nm','app_nm']
+        )
+        merged_df['job_status']=merged_df['job_status'].fillna('Failed')
+        merged_df['job_status'] = np.where(merged_df['prod_to_ple'] == 1, 'success', np.where(merged_df['prod_to_ple'] == -1, 'Dag_Failed', merged_df['job_status']))
+        merged_df['TD_Row_Count']=merged_df['TD_Row_Count'].fillna('0')
+        merged_df['BQ_Row_Count']=merged_df['BQ_Row_Count'].fillna('0')
+        merged_df['Time_Taken']=merged_df['Time_Taken'].fillna('0')
+        merged_df=merged_df.drop(columns=['db_tbl_nm','app_nm'])
+        if count_true==len(df):
+            print("all table done")
+        else:
+            print("##########################################")
+            print("Following tables are not created in BQ PLE")
+            print(df[df['table_creation'] == "False"]['BQ_Table'].tolist())
+            print("##########################################")
+        print("Table Status")
+        print("\n",merged_df.to_string(index=False))
+        ti.xcom_push(key='tbl_load_dtl', value=merged_df.to_dict())
+
+
+def send_report_email(**kwargs):
+    ti=kwargs['ti']
+    tbl_load_dtl=ti.xcom_pull(task_ids='Table_Loading_Status', key='tbl_load_dtl')
+    Email_id=ti.xcom_pull(task_ids='Queue_Table_Preperation', key='Email_id')
+    ddf=pd.DataFrame(tbl_load_dtl)
+    if 'Prod_Load_flag' not in ddf.columns:
+        ddf['Prod_Load_flag'] = 0
+    if 'Ple_Load_flag' not in ddf.columns:
+        ddf['Ple_Load_flag'] = 1
+    is_final = kwargs.pop('is_final', False)
+    recipient_email=Email_id+",user@example.com,user@example.com"
+    recipient_emails=[email.strip() for email in recipient_email.split(',')]
+    subject="HDL Load Report (Final)" if is_final else "HDL Load Report (Update - Not Final)"
+    print("sending email report of table load")
+    print(ddf)
+    print(recipient_emails)
+    ddf['Large_table_status'] = ddf['Large_table_status'].str.lower() == 'true'
+    # Filtered DataFrames
+    meta_missing_df = ddf[~ddf['Metadata_available']][['BQ_Table', 'TD_table', 'App_Name']].reset_index(drop=True)
+    large_tables_df = ddf[ddf['Large_table_status']][['BQ_Table', 'TD_table', 'App_Name', 'Table_Size_Gb']].reset_index(drop=True)
+    prod_to_ple_df = ddf[ddf['prod_to_ple']==1][['BQ_Table', 'TD_table', 'App_Name', 'Table_Size_Gb']].reset_index(drop=True)
+    df_success=(ddf['job_status']!='Dag_Failed').sum()
+    dag_failed_count=(ddf['job_status']=='Dag_Failed').sum()
+    dag_failed_sql=f"select concat(tgt_schema,'.',tgt_table),error_message from {HDL_project}.{Audit_db}_nogsam_v.{Audit_tbl} where dag_run_id='{str(ddf['run_id'].iloc[0])}' and job_status='Dag_Failed'"
+    # Summary counts
+    total_tables = len(ddf)
+    to_be_loaded = int(ddf['queue_table_status'].sum())
+    meta_missing_count = len(meta_missing_df)
+    large_count = len(large_tables_df)
+    prod_to_ple_cnt=len(prod_to_ple_df)
+    if total_tables==to_be_loaded & total_tables==df_success:
+        overall_status='Success'
+    elif df_success>0:
+        overall_status='Partially Success'
+    else:
+        overall_status='Failed'
+    summary_df = ddf.groupby('job_status').size().reset_index(name='COUNT')
+    summary_rows = "\n".join([
+        f"<tr><td>{row['job_status']}</td><td>{row['COUNT']}</td></tr>"
+        for _, row in summary_df.iterrows()
+    ])
+
+    # Build detail rows
+    detail_rows = "\n".join([
+        f"<tr><td>{i+1}</td><td>{row['BQ_Table']}</td><td>{row['TD_table']}</td>"
+        f"<td>{row['App_Name']}</td><td>{row['Prod_Load_flag']}</td><td>{row['Ple_Load_flag']}</td>"
+        f"<td>{'Yes' if row['table_creation'] else 'No'}</td>"
+        f"<td>{row['job_status']}</td><td>{str(row['TD_Row_Count'])}</td><td>{str(row['BQ_Row_Count'])}</td>"
+        f"<td>{str(int(row['TD_Row_Count']) - int(row['BQ_Row_Count']))}</td><td>{str(row['Time_Taken'])}</td><td>{row['Loading_Source']}</td></tr>"
+        for i, (_,row) in enumerate(ddf.iterrows())
+    ])
+
+    # Build HTML body
+    html_content = f"""
+    <html>
+    <style>
+    body {{
+        font-family: Arial, sans-serif;
+    }}
+    table {{
+        border-collapse: collapse;
+        width: 100%;
+        margin-bottom: 20px;
+    }}
+    th {{
+        border: 2px solid #000000;
+        background-color: #b3d9ff;
+        padding: 10px;
+        text-align: center;
+    }}
+    td {{
+        border: 1px solid #999999;
+        padding: 10px;
+        text-align: center;
+    }}
+    .summary-table th, .summary-table td {{
+        border: 1px solid #666666;
+    }}
+</style>
+    <body>
+      {"" if is_final else "<p style='text-align:center;background:#fff3cd;border:1px solid #ffc107;padding:10px;font-size:14px;'><b>&#9888; This is an interim update email. Load is still in progress. A final report will be sent once all tables complete.</b></p>"}
+      <h1 style='text-align: center;'>TABLE LOADING REPORT For Dag run {ddf['run_id'].iloc[0]}</h1>
+      <h2>HDL Overall Status: {overall_status}</h2>
+      <h3 style='text-align: center;'>Table Loading Summary</h3>
+
+      <table style='width:25%;height:50px'>
+        <tr style='background-color:#88CEEB'><td>METRIC</td><td>COUNT</td>
+        <tr><td>TOTAL TABLE LIST PASSED </td><td>{total_tables}</td></tr>
+        <tr><td>TOTAL TABLE TRIGGERED </td><td>{to_be_loaded}</td></tr>
+        <tr><td>METADATE MISSING FOR TABLE </td><td>{meta_missing_count}</td></tr>
+        <tr><td>LARGE TABLE COUNT </td><td>{large_count}</td></tr>
+      </table>
+
+
+      <table style='width:25%;height:50px'>
+        <tr style='background-color:#88CEEB'><td style="font-weight:bold;">JOB_STATUS</td><td style="font-weight:bold;">COUNT</td></tr>
+        {summary_rows}
+      </table>
+
+      <h3>Status Notation</h3>
+      <table style='width:55%;border-collapse:collapse;margin-bottom:20px;'>
+        <tr style='background-color:#88CEEB'><th style='padding:8px;border:1px solid #999;'>Status</th><th style='padding:8px;border:1px solid #999;'>Meaning</th></tr>
+        <tr style='background-color:#f8d7da'><td style='padding:8px;border:1px solid #999;'><b>Dag_Failed</b></td><td style='padding:8px;border:1px solid #999;'>Actual failure — DAG encountered an error during execution</td></tr>
+        <tr style='background-color:#fff3cd'><td style='padding:8px;border:1px solid #999;'><b>SKIPPED</b></td><td style='padding:8px;border:1px solid #999;'>Row counts matched between TD and BQ — no data movement needed</td></tr>
+        <tr style='background-color:#d4edda'><td style='padding:8px;border:1px solid #999;'><b>success</b></td><td style='padding:8px;border:1px solid #999;'>Data copied successfully from TD to BQ</td></tr>
+        <tr style='background-color:#cce5ff'><td style='padding:8px;border:1px solid #999;'><b>Running</b></td><td style='padding:8px;border:1px solid #999;'>Still in progress — table load has not yet completed</td></tr>
+        <tr style='background-color:#e2e3e5'><td style='padding:8px;border:1px solid #999;'><b>table_not_found</b></td><td style='padding:8px;border:1px solid #999;'>Target BQ table does not exist — table creation may have failed</td></tr>
+      </table>
+
+      <h3 style='text-align: center;'>Top 100 table loading status are showing.</h3>
+
+      <table style='width:100%'>
+        <tr style='background-color:#88CEEB'>
+          <th>Sr. No.</th>
+          <th>BQ TBL NM</th>
+          <th>TD TBL NM</th>
+          <th>APP NAME</th>
+          <th>PROD LOAD FLAG</th>
+          <th>PLE LOAD FLAG</th>
+          <th>TABLE CREATION</th>
+          <th>JOB STATUS</th>
+          <th>TD ROW COUNT</th>
+          <th>BQ ROW COUNT</th>
+          <th>TD BQ DIFF COUNT</th>
+          <th>TOTAL TIME TAKEN BY JOB(MIN)</th>
+          <th>LOADING SOURCE</th>
+        </tr>
+        {detail_rows}
+      </table>
+
+      {'<h2 style="color:red;">Failed Tables - Error Details</h2><p>To check error messages for failed tables, run this query on BigQuery:</p><pre style="background:#f4f4f4;padding:10px;border-left:4px solid #e53935;font-size:13px;white-space:pre-wrap;">' + dag_failed_sql + '</pre>' if dag_failed_count > 0 else ''}
+
+      <p style='text-align:center; font-size:9px'>
+        This is System Generated Email <br>
+        Don't Reply on this Email id <br>
+        Thank You for using Data Transfer Service
+      </p>
+    </body>
+    </html>
+    """
+
+    send_email(to=recipient_emails, subject=subject, html_content=html_content)
+    print("Email sent successfully.")
+
+
+def fail_task(context):
+    ti=context['ti']
+    task_instance=context.get('task_instance')
+    exception=context.get('exception')
+    error=str(task_instance)+" "+str(exception)
+
+Queue_Table_Preperation = PythonOperator(
+    task_id='Queue_Table_Preperation',
+    python_callable=Queue_Table_List,
+    provide_context=True,
+    dag=dag,
+    on_failure_callback=fail_task
+)
+
+get_table_load_status = PythonOperator(
+    task_id='Table_Loading_Status',
+    python_callable=Get_Table_Loading_Status,
+    provide_context=True,
+    dag=dag,
+    on_failure_callback=fail_task
+)
+
+
+all_table_done = PythonOperator(
+    task_id="send_report_email",
+    python_callable=send_report_email,
+    provide_context=True,
+    op_kwargs={'is_final': True},
+    dag=dag,
+    on_failure_callback=fail_task
+)
+Queue_Table_Preperation >> get_table_load_status >> all_table_done

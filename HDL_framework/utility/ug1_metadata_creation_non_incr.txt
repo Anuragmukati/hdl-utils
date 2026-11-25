@@ -1,0 +1,291 @@
+sh proddo.sh
+if [ -z "$1" ]; then
+        echo "please provide Table List"
+	echo "Usage: $0 \"'src_db.src_tbl1','src_db.src_tbl2'\" "APP_NAME""
+        exit 1
+fi
+if [ -z "$2" ]; then
+        echo "please provide App_Name"
+        exit 1
+fi
+
+if [ -z "$3" ]; then
+        dbc_col_tbl='dbc_columnsv'
+else
+        dbc_col_tbl='dbc_columnsv_p2'
+fi
+echo "Inserting Metadata for $1 and $2 with $dbc_col_tbl"
+
+if [ "$2" = "Adcpdo" ]; then
+        prd_proj='PROJECT_ID_102'
+
+elif [ "$2" = "Zdwvdo" ]; then
+        prd_proj='PROJECT_ID_02'
+elif [ "$2" = "Zdwvdo_p2" ]; then
+        prd_proj='PROJECT_ID_02'
+elif [ "$2" = "Zdwvdo_PP_Full" ]; then
+        prd_proj='PROJECT_ID_02'
+elif [ "$2" = "Zdwvdo_PP_Full_Daily" ]; then
+        prd_proj='PROJECT_ID_02'
+elif [ "$2" = "Zdwvdo_PP_Full_R2" ]; then
+        prd_proj='PROJECT_ID_02'
+
+elif [ "$2" = "Enabdo" ]; then
+        prd_proj='PROJECT_ID_96'
+elif [ "$2" = "Enabdo_p2" ]; then
+        prd_proj='PROJECT_ID_96'
+elif [ "$2" = "Enabdo_PP_Full" ]; then
+        prd_proj='PROJECT_ID_96'
+elif [ "$2" = "Enabdo_PP_Full_Daily" ]; then
+        prd_proj='PROJECT_ID_96'
+
+elif [ "$2" = "Pblsdo" ]; then
+        prd_proj='PROJECT_ID_92'
+elif [ "$2" = "Pblsdo_p2" ]; then
+        prd_proj='PROJECT_ID_92'
+elif [ "$2" = "Pblsdo_PP_Full_Daily" ]; then
+        prd_proj='PROJECT_ID_92'
+		
+elif [ "$2" = "Msgcdo" ]; then
+        prd_proj='PROJECT_ID_90'
+elif [ "$2" = "Msgcdo_p2" ]; then
+        prd_proj='PROJECT_ID_90'
+elif [ "$2" = "Msgcdo_PP_Full" ]; then
+        prd_proj='PROJECT_ID_96'
+elif [ "$2" = "Msgcdo_PP_Full_Daily" ]; then
+        prd_proj='PROJECT_ID_96'
+
+elif [ "$2" = "Vzendo" ]; then
+        prd_proj='PROJECT_ID_94'
+elif [ "$2" = "Vzendo_p2" ]; then
+        prd_proj='PROJECT_ID_94'
+elif [ "$2" = "Vzendo_PP_Full" ]; then
+        prd_proj='PROJECT_ID_94'
+elif [ "$2" = "Vzendo_PP_Full_Daily" ]; then
+        prd_proj='PROJECT_ID_94'
+
+elif [ "$2" = "Fpardo" ]; then
+        prd_proj='PROJECT_ID_131'
+elif [ "$2" = "Fpardo_p2" ]; then
+        prd_proj='PROJECT_ID_131'
+elif [ "$2" = "Fpardo_PP_Full" ]; then
+        prd_proj='PROJECT_ID_131'
+elif [ "$2" = "Fpardo_PP_Full_Daily" ]; then
+        prd_proj='PROJECT_ID_131'
+elif [ "$2" = "Fpardo_PP_Full_R2" ]; then
+        prd_proj='PROJECT_ID_131'
+
+
+elif [ "$2" = "Cmhbdo" ]; then
+        prd_proj='PROJECT_ID_98'
+elif [ "$2" = "Cmhbdo_p2" ]; then
+        prd_proj='PROJECT_ID_98'
+elif [ "$2" = "Cmhbdo_PP_Full" ]; then
+        prd_proj='PROJECT_ID_98'
+elif [ "$2" = "Cmhbdo_PP_Full_Daily" ]; then
+        prd_proj='PROJECT_ID_98'
+elif [ "$2" = "Cmhbdo_PP_Full_R2" ]; then
+        prd_proj='PROJECT_ID_98'
+
+elif [ "$2" = "Bizdo" ]; then
+        prd_proj='PROJECT_ID_24'
+elif [ "$2" = "Bizdo_p2" ]; then
+        prd_proj='PROJECT_ID_24'
+elif [ "$2" = "Bizdo_PP_Full" ]; then
+        prd_proj='PROJECT_ID_24'
+elif [ "$2" = "Bizdo_PP_Full_Daily" ]; then
+        prd_proj='PROJECT_ID_24'
+elif [ "$2" = "Bizdo_PP_Incr_Daily" ]; then
+        prd_proj='PROJECT_ID_24'
+elif [ "$2" = "Bizdo_PP_Full_Daily_R2" ]; then
+        prd_proj='PROJECT_ID_24'
+
+
+
+elif [ "$2" = "Gk1vdo" ]; then
+        prd_proj='PROJECT_ID_30'
+elif [ "$2" = "Gk1vdo_p2" ]; then
+        prd_proj='PROJECT_ID_30'
+elif [ "$2" = "Gk1vdo_PP_Hist" ]; then
+        prd_proj='PROJECT_ID_30'
+elif [ "$2" = "Gk1vdo_PP_Full" ]; then
+        prd_proj='PROJECT_ID_30'
+elif [ "$2" = "Gk1vdo_PP_Incr" ]; then
+        prd_proj='PROJECT_ID_30'
+elif [ "$2" = "Gk1vdo_PP_Full_Daily" ]; then
+	prd_proj='PROJECT_ID_30'
+elif [ "$2" = "Gk1vdo_PP_Incr_Daily" ]; then
+        prd_proj='PROJECT_ID_30'
+elif [ "$2" = "Gk1vdo_PP_Full_Daily_R2" ]; then
+        prd_proj='PROJECT_ID_30'
+else
+        echo "Pass correct App Name and check with developer if its new app name"
+        exit -1
+fi
+
+echo "${prd_proj}"
+export PATH=$PATH:/apps/opt/application/google-cloud-sdk/bin/
+
+bq query --nouse_legacy_sql --max_rows=1000000 --format=csv "insert into PROJECT_ID_31.edw_data_migration_ops_tbls.historical_load_metadata_table (is_table_active,table_uid,src_schema,src_table,stg_schema,stg_table,tgt_schema,tgt_table,load_type,delta_column,delta_column_type,delta_column_format,delta_interval,app_name,src_table_size,src_table_row_count,src_table_type,bus_key_column,change_value_column,start_date_column,end_date_column,stg_load_enabled,plican_validation_enabled,select_query,load_functionality,select_query_tpt,spool_flag,bq_to_bq_query,stg_project_id,tgt_project_id)
+WITH cte1 AS (
+SELECT
+c.databasename,
+c.tablename,
+c.columnName,
+c.columntype,
+c.Nullable,
+c.columnlength,
+t.total_size_GB,
+row_number() OVER (PARTITION BY c.databasename, c.tablename ORDER BY c.columnid) columnid,
+
+(
+CASE
+WHEN columntype IN ('CO','SC','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'N' THEN
+CONCAT(
+'CASE WHEN RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \' \'), CHR(13), \' \')) = \'\' ',
+'THEN \' \' ELSE RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \' \'), CHR(13), \' \')) ',
+'END AS \"', TRIM(columnname), '\"'
+)
+WHEN columntype IN ('CO','SC','XM','UT','VA','CF','CV') AND columnlength <= 20 AND Nullable = 'N' THEN
+CONCAT(
+'CASE WHEN RTRIM(\"', TRIM(columnname), '\") = \'\' ',
+'THEN \' \' ELSE RTRIM(\"', TRIM(columnname), '\") END AS \"', TRIM(columnname), '\"'
+)
+WHEN columntype IN ('CO','SC','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'Y' THEN
+CONCAT('RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \' \'), CHR(13), \' \')) AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('CO','SC','XM','UT','VA','CF','CV') AND Nullable = 'Y' THEN
+CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('D','N') THEN
+CONCAT('CAST(\"', TRIM(columnname), '\" AS DECIMAL(',COALESCE(decimaltotaldigits,38),',',COALESCE(decimalfractionaldigits,19),'))',' AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('I1') THEN
+CONCAT('CAST(\"', TRIM(columnname), '\" AS INTEGER) AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('BF','BO') THEN
+CONCAT('CAST(\"', TRIM(columnname), '\" AS VARBYTE(10000)) AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('DA','DT') THEN
+CONCAT('TO_CHAR(\"', TRIM(columnname), '\", \'YYYY-MM-DD\') AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('AT') THEN
+CONCAT('TO_CHAR(\"', TRIM(columnname), '\",\'HH24:MI:SS.FF6\') AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('TS','TZ') THEN
+CONCAT(
+'TO_CHAR(CASE WHEN \"', TRIM(columnname), '\" >= TIMESTAMP \'9999-12-31 23:59:59\' ',
+'THEN TIMESTAMP \'9999-12-31 23:59:59.000000\' ELSE \"', TRIM(columnname),
+'\" END, \'YYYY-MM-DD HH24:MI:SS.FF6\') AS \"', TRIM(columnname), '\"'
+)
+ELSE
+CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')
+END
+) AS NEW_COLUMN,
+
+(
+CASE
+WHEN columntype IN ('CO','SC','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'N' THEN
+CONCAT(
+'CASE WHEN RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \'\' \'\'), CHR(13),\'\' \'\')) = \'\'\'\' ',
+'THEN \'\' \'\' ELSE RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \'\' \'\'), CHR(13), \'\' \'\')) ',
+'END AS \"', TRIM(columnname), '\"'
+)
+WHEN columntype IN ('CO','SC','XM','UT','VA','CF','CV') AND columnlength <= 20 AND Nullable = 'N' THEN
+CONCAT(
+'CASE WHEN RTRIM(\"', TRIM(columnname), '\") = \'\'\'\' ',
+'THEN \'\' \'\' ELSE RTRIM(\"', TRIM(columnname), '\") END AS \"', TRIM(columnname), '\"'
+)
+WHEN columntype IN ('CO','SC','XM','UT','VA','CF','CV') AND columnlength > 20 AND Nullable = 'Y' THEN
+CONCAT('RTRIM(OREPLACE(OREPLACE(\"', TRIM(columnname), '\", CHR(10), \'\' \'\'), CHR(13), \'\' \'\')) AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('CO','SC','XM','UT','VA','CF','CV') AND Nullable = 'Y' THEN
+CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')
+ELSE
+CONCAT('\"', TRIM(columnname), '\"')
+END
+) AS NEW_COLUMN_TPT,
+
+(
+CASE
+WHEN columntype IN ('SC','XM','UT','VA','CF','CV')  THEN
+CONCAT('RTRIM(\"', TRIM(columnname), '\") AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('BF','BO') THEN
+CONCAT('CAST(\"', TRIM(columnname), '\" AS VARBYTE(10000)) AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('AT','TZ') THEN
+CONCAT('CAST(CAST(\"', TRIM(columnname), '\" AS TIME(6) FORMAT \'HH:MI:SS.s(6)\') AS VARCHAR(16)) AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('DA','DT') THEN
+CONCAT('CAST(\"', TRIM(columnname), '\" AS DATE FORMAT \'YYYY-MM-DD\') AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('TS','SZ') THEN
+CONCAT(
+'CAST(CAST(CASE WHEN \"', TRIM(columnname), '\" >= TIMESTAMP \'9999-12-31 23:59:59\' ',
+'THEN TIMESTAMP \'9999-12-31 23:59:59\' ELSE \"', TRIM(columnname),
+'\" END AS TIMESTAMP(6) FORMAT \'YYYY-MM-DDBHH:MI:SS.S(6)\') AS VARCHAR(26)) AS \"', TRIM(columnname), '\"'
+)
+--WHEN columntype IN ('D','N') THEN
+--CONCAT('CAST(\"', TRIM(columnname), '\" AS DECIMAL(',COALESCE(decimaltotaldigits,38),',',COALESCE(decimalfractionaldigits,19),'))',' AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('D','N','F') THEN
+CONCAT('CAST(\"', TRIM(columnname), '\" AS VARCHAR(100))',' AS \"', TRIM(columnname), '\"')
+WHEN columntype in ('MO') then 
+CONCAT('CAST(\"', TRIM(columnname), '\" AS INTEGER)',' AS \"', TRIM(columnname), '\"')
+WHEN columntype IN ('JN') THEN
+CONCAT('CAST(\"',TRIM(columnname),'\" AS Clob) AS \"', TRIM(columnname),'\"' )
+WHEN columntype In ('DS','HS') THEN 
+CONCAT('CAST(\"',TRIM(columnname),'\" AS VARCHAR(20)) AS \"',TRIM(columnname),'\"' )
+WHEN COLUMNTYPE in ('CO') THEN
+CONCAT('CAST(\"',TRIM(columnname),'\" AS VARCHAR(30000)) AS \"',TRIM(columnname),'\"' )
+ELSE
+CONCAT('\"', TRIM(columnname), '\"')
+END
+) AS NEW_COLUMN_BQ_TO_BQ
+
+FROM
+PROJECT_ID_31.edw_data_migration_ops_tbls.$dbc_col_tbl c LEFT JOIN PROJECT_ID_31.edw_data_migration_ops_tbls.dbc_tablesizev t
+ON TRIM(LOWER(c.databasename)) = TRIM(LOWER(t.databasename))
+AND TRIM(LOWER(c.tablename)) = TRIM(LOWER(t.tablename))
+WHERE
+    LOWER(CONCAT(TRIM(c.databasename), '.', TRIM(c.tablename))) IN ($1)
+),
+
+cte2 AS (
+SELECT
+databasename,
+tablename,
+total_size_GB,
+STRING_AGG(NEW_COLUMN ORDER BY columnid) AS selectcol,
+STRING_AGG(NEW_COLUMN_TPT ORDER BY columnid) AS selectcol_tpt,
+STRING_AGG(NEW_COLUMN_BQ_TO_BQ ORDER BY columnid) AS selectcol_bq
+FROM
+cte1
+GROUP BY 1, 2, 3
+)
+
+SELECT
+TRUE AS is_table_active,
+CONCAT(TRIM(databasename), '__', TRIM(tablename)) AS table_uid,
+case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') when '$4'='_VW' then concat(TRIM(databasename),'_VW')   else trim(databasename) end AS src_schema,
+TRIM(tablename) AS src_table,
+'edw_data_migration_opsstg_tbls' AS stg_schema,
+CONCAT(LOWER(TRIM(databasename)), '__', LOWER(TRIM(tablename))) AS stg_table,
+LOWER(TRIM(databasename)) AS tgt_schema,
+LOWER(TRIM(tablename)) AS tgt_table,
+'FullLoad' AS load_type,
+'' AS delta_column,
+'' AS delta_column_type,
+'' AS delta_column_format,
+0 AS delta_interval,
+'$2' AS app_name,
+CONCAT(CAST(total_size_GB AS STRING), 'GB') AS src_table_size,
+0 AS src_table_row_count,
+CASE
+WHEN total_size_GB > 499 THEN 'Large'
+WHEN total_size_GB > 100 THEN 'Medium'
+ELSE 'Small'
+END AS src_table_type,
+'' AS bus_key_column,
+'' AS change_value_column,
+'' AS start_date_column,
+'' AS end_date_column,
+False AS stg_load_enabled,
+False AS plican_validation_enabled,
+CONCAT('select ', selectcol, ' from ', case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end, '.', TRIM(tablename)) AS select_query,
+'NOS' AS load_functionality,
+CONCAT('select ', selectcol_tpt, ' from ',case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end,'.',TRIM(tablename)) AS select_query_tpt,
+0 AS SPOOL_FLAG,
+CONCAT('select ', selectcol_bq, ' from ',case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') else trim(databasename) end, '.', TRIM(tablename)) as bq_to_bq_query,
+'${prd_proj}' AS stg_project_id,
+'${prd_proj}' AS tgt_project_id
+FROM
+cte2 WHERE CONCAT(LOWER(case when upper(trim(databasename)) like '%BODS%' then concat(TRIM(databasename),'_VW') when '$4'='_VW' then concat(TRIM(databasename),'_VW') else trim(databasename) end),LOWER(TRIM(tablename)),'$2')  NOT IN (Select CONCAT(LOWER(TRIM(src_schema)),LOWER(TRIM(src_table)),app_name) from  PROJECT_ID_31.edw_data_migration_ops_tbls.historical_load_metadata_table );"

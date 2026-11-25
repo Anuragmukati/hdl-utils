@@ -1,0 +1,241 @@
+import logging
+import json
+import random
+from datetime import datetime
+import pandas as pd
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.settings import Session
+from airflow.models import DagRun, TaskInstance
+from airflow.utils.state import State
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from sqlalchemy import desc
+
+logger = logging.getLogger("airflow.task")
+
+BASE_DIR = "/home/airflow/gcs/dags/PROJECT_ID_25/"
+
+def read_config():
+    with open(f'{BASE_DIR}history_load_config_wave_wb.json', 'r') as f:
+        return json.load(f)
+
+config = read_config()
+
+# ── Set project here — all connections and project spaces are derived from this ──
+# Valid projects: zdwvdo/zdwvbizdo/coasdo/bglodo/bgtsdo/bhubdo/bopsdo/bsopdo/bsyido
+#                 factdo/fcredo/ffrado/frvado/vcgfdofbi/vcgfdofnv/vcgfdocfc/vcgfdorbi
+project    = "zdwvdo"
+BQ_CONN_ID = config[f"GCP_CONN_DO_ID_{project}"]
+BQ_PROJECT = config[f"bq_prod_project_{project}"]
+dag_folder = config[f"dag_folder_{project}"]
+# ─────────────────────────────────────────────────────────────────────────────────
+
+BQ_METADATA_TABLE = f"{BQ_PROJECT}.edw_data_migration_audit_tbls.edw_mig_bq_to_td_writeback_metadata"
+BQ_AUDIT_TABLE    = f"{BQ_PROJECT}.edw_data_migration_audit_tbls.edw_mig_bq_to_td_writeback_audit_updated"
+
+# load_instances value that identifies scheduled (non-triggered) DAGs
+LOAD_INSTANCES_FILTER = 0
+
+DAG_ID            = f"dg_{project}_writeback_scheduled_dag_audit"
+SCHEDULE_INTERVAL = "*/30 * * * *"
+
+local_tz = pendulum.timezone("America/New_York")
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date': datetime(2026, 3, 9, tzinfo=local_tz),
+    'retries': 0
+}
+
+
+def fetch_latest_run_status(**context):
+    """Fetches the latest Airflow run state and timing for all scheduled writeback DAGs."""
+    bq_hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID)
+    metadata_query = f"""
+        SELECT writeback_dag_name
+        FROM `{BQ_METADATA_TABLE}`
+        WHERE is_active = TRUE
+          AND load_instances = {LOAD_INSTANCES_FILTER}
+          AND app_name = '{project}'
+    """
+    df = bq_hook.get_pandas_df(sql=metadata_query, dialect="standard", location="US")
+    if df.empty:
+        logger.info("No scheduled DAGs found in metadata for project: %s", project)
+        return []
+
+    dag_list = df['writeback_dag_name'].tolist()
+    session  = Session()
+    results  = []
+
+    for dag_id in dag_list:
+        dr = (
+            session.query(DagRun)
+            .filter(DagRun.dag_id == dag_id)
+            .order_by(desc(DagRun.execution_date))
+            .first()
+        )
+        if not dr:
+            results.append({
+                "dag_id": dag_id,
+                "dag_state": "NOT_FOUND",
+                "execution_date": "-",
+                "failed_task_id": "-"
+            })
+            continue
+
+        failed_task_id = "-"
+        if dr.state == State.FAILED:
+            failed_ti = (
+                session.query(TaskInstance)
+                .filter(
+                    TaskInstance.dag_id == dag_id,
+                    TaskInstance.run_id == dr.run_id,
+                    TaskInstance.state  == State.FAILED
+                )
+                .order_by(TaskInstance.start_date)
+                .first()
+            )
+            if failed_ti:
+                failed_task_id = failed_ti.task_id
+
+        results.append({
+            "dag_id":         dag_id,
+            "dag_state":      dr.state,
+            "execution_date": str(dr.execution_date),
+            "failed_task_id": failed_task_id,
+            "start_date":     dr.start_date,
+            "end_date":       dr.end_date
+        })
+
+    session.close()
+    return results
+
+
+def audit_scheduled_dags(**context):
+    """
+    Filters DAGs whose latest run ended within the current data interval window
+    and inserts audit records into the BQ audit table.
+    """
+    dag_statuses        = context["ti"].xcom_pull(task_ids="fetch_latest_run_status") or []
+    data_interval_start = context.get("data_interval_start")
+    data_interval_end   = context.get("data_interval_end")
+    exec_hour           = context['execution_date'].strftime('%H:00')
+
+    logger.info("Checking data interval: %s to %s", data_interval_start, data_interval_end)
+
+    dags_in_window = []
+    for r in dag_statuses:
+        end_date = r.get('end_date')
+        if not end_date:
+            continue
+        if data_interval_start <= end_date <= data_interval_end:
+            start_time_est = (
+                pendulum.instance(r['start_date']).in_timezone('America/New_York').format('YYYY-MM-DD HH:mm:ss')
+                if r.get('start_date') else None
+            )
+            end_time_est = pendulum.instance(end_date).in_timezone('America/New_York').format('YYYY-MM-DD HH:mm:ss')
+            dag_state    = str(r['dag_state']).upper() if r.get('dag_state') else 'UNKNOWN'
+
+            dags_in_window.append({
+                'writeback_dag_name':  r['dag_id'],
+                'dag_run_start_time':  start_time_est,
+                'dag_run_end_time':    end_time_est,
+                'dag_state':           dag_state
+            })
+            logger.info("DAG %s in window — state: %s", r['dag_id'], dag_state)
+
+    if not dags_in_window:
+        logger.info("No DAG runs ended in the current window.")
+        return
+
+    logger.info("Found %d DAG runs in window. Fetching metadata.", len(dags_in_window))
+
+    dag_names_quoted = ", ".join([f"'{d['writeback_dag_name']}'" for d in dags_in_window])
+    bq_hook = BigQueryHook(gcp_conn_id=BQ_CONN_ID)
+    metadata_query = f"""
+        SELECT *
+        FROM `{BQ_METADATA_TABLE}`
+        WHERE writeback_dag_name IN ({dag_names_quoted})
+          AND is_active = TRUE
+          AND load_instances = {LOAD_INSTANCES_FILTER}
+          AND app_name = '{project}'
+    """
+    metadata_df = bq_hook.get_pandas_df(sql=metadata_query, dialect="standard", location="US")
+
+    if metadata_df.empty:
+        logger.info("No metadata found for DAGs in window. Skipping audit.")
+        return
+
+    timing_df  = pd.DataFrame(dags_in_window)
+    merged_df  = metadata_df.merge(timing_df, on='writeback_dag_name', how='inner')
+
+    if merged_df.empty:
+        logger.info("No matching records after merge. Skipping audit.")
+        return
+
+    logger.info("Inserting audit records for %d DAGs.", len(merged_df))
+
+    bq_values = []
+    for _, row in merged_df.iterrows():
+        dag_start = row.get('dag_run_start_time', pendulum.now('America/New_York').format('YYYY-MM-DD HH:mm:ss'))
+        dag_end   = row.get('dag_run_end_time',   pendulum.now('America/New_York').format('YYYY-MM-DD HH:mm:ss'))
+        dag_state = row.get('dag_state', 'UNKNOWN')
+
+        bq_values.append(f"""(
+            '{row['bq_table_name']}',
+            '{row['td_table_name']}',
+            '{dag_state}',
+            '',
+            NULL,
+            NULL,
+            '{row.get('function_id', '')}',
+            '{row.get('writeback_composer_instance', '')}',
+            '{row['writeback_dag_name']}',
+            CURRENT_TIMESTAMP(),
+            CURRENT_DATETIME(),
+            '{row.get('load_type', '')}',
+            '{row.get('load_functionality', '')}',
+            DATETIME'{dag_start}',
+            '{exec_hour}',
+            NULL,
+            DATETIME'{dag_end}',
+            'scheduled_dag',
+            NULL
+        )""")
+
+    if bq_values:
+        bq_insert_query = f"""
+            INSERT INTO `{BQ_AUDIT_TABLE}`
+            (bq_table_name, td_table_name, writeback_status, data_size_gb,
+             bq_count, td_count, functional_id, composer_instance, writeback_dag_name,
+             audit_ts, last_update_ts, load_type, load_functionality,
+             start_time, execution_hour, table_last_modified_when_wb,
+             end_time, trigger_type, max_tls)
+            VALUES {", ".join(bq_values)}
+        """
+        bq_hook.run_query(sql=bq_insert_query, use_legacy_sql=False)
+        logger.info("Inserted %d audit rows into BQ audit table.", len(bq_values))
+
+
+with DAG(
+    dag_id=DAG_ID,
+    start_date=datetime(2026, 3, 9, tzinfo=local_tz),
+    schedule_interval=SCHEDULE_INTERVAL,
+    catchup=True,
+    default_args=default_args,
+    tags=["monitoring", "audit", project],
+) as dag:
+
+    fetch_status_task = PythonOperator(
+        task_id="fetch_latest_run_status",
+        python_callable=fetch_latest_run_status
+    )
+
+    audit_scheduled_dags_task = PythonOperator(
+        task_id="audit_scheduled_dags",
+        python_callable=audit_scheduled_dags
+    )
+
+    fetch_status_task >> audit_scheduled_dags_task

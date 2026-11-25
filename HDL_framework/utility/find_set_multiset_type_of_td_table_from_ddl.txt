@@ -1,0 +1,48 @@
+import os
+import re
+import csv
+
+
+SOURCE_DIRECTORY = 'C:/path/to/local/file'  # Folder where your DDL files are stored
+OUTPUT_FILE = 'C:/path/to/local/file'
+
+def identify_table_type(file_path):
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read().upper()
+        
+        # Regex to find "CREATE [MULTISET/SET] TABLE db_nm.tbl_nm"
+        # Handles potential newlines and extra spaces
+        match = re.search(r'CREATE\s+(MULTISET|SET)\s+TABLE\s+([\w\.]+)', content)
+        
+        if match:
+            table_type = match.group(1).lower()
+            table_name = match.group(2).lower()
+            return table_name, table_type
+    return None
+
+def main():
+    results = []
+    
+    # Check if directory exists
+    if not os.path.exists(SOURCE_DIRECTORY):
+        print(f"Error: Directory '{SOURCE_DIRECTORY}' not found.")
+        return
+
+    # Process files
+    for filename in os.listdir(SOURCE_DIRECTORY):
+        if filename.endswith(('.sql', '.txt')):
+            file_path = os.path.join(SOURCE_DIRECTORY, filename)
+            data = identify_table_type(file_path)
+            if data:
+                results.append(data)
+
+    # Write to CSV
+    with open(OUTPUT_FILE, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['db_nm.tbl_nm', 'table_type'])
+        writer.writerows(results)
+
+    print(f"Process complete. Output saved to: {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
